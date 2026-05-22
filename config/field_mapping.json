@@ -1,0 +1,55 @@
+{
+  "_description": "place_crawler 수집 key → field_dictionary 표준 key 매핑",
+  "_unmapped_policy": "매핑 테이블에 없는 원본 key는 원본 key 그대로 crawl_data에 저장",
+  "_collection_method": {
+    "dom_extracted": [
+      "place_name (h1 태그 또는 body_text 패턴)",
+      "lot_address (체계적 주소 정규식)",
+      "phone (전화번호 정규식)",
+      "business_hours (영업시간 컨텍스트)",
+      "break_time (브레이크타임 컨텍스트)",
+      "last_order (라스트오더 컨텍스트)",
+      "closed_days (정기휴무 컨텍스트)",
+      "parking (주차 키워드)",
+      "takeout (포장 키워드)",
+      "facilities (편의 컨텍스트)",
+      "menu_list (메뉴 탭 클릭 후 가격 패턴)",
+      "keywords (체험단 키워드)",
+      "description (가게 소개 컨텍스트)",
+      "directions (찾아가는길 컨텍스트)",
+      "photo_count (이미지 갯수 / img[alt] 수)",
+      "visitor_review_count (방문자 리뷰 N 패턴)",
+      "blog_review_count (블로그 리뷰 N 패턴)",
+      "reservation_active (예약 버튼/링크 텍스트)",
+      "naver_pay_active (네이버페이 버튼/링크 텍스트)",
+      "coupon_active (쿠폰 버튼/링크 텍스트)",
+      "talktalk_active (톡톡 버튼/링크 텍스트)",
+      "smartcall_active (스마트콜 버튼/링크 텍스트)",
+      "latest_news_date (소식 날짜 패턴)"
+    ],
+    "html_script_extracted": {
+      "rating": "<script> 임베드 JSON avgRating — 봇 차단 시에도 보존됨 (place-revum naver_place.py 참조)",
+      "lot_address_fallback": "<script> 임베드 JSON roadAddress/address — DOM 미표시 시 폴백",
+      "phone_fallback": "<script> 임베드 JSON tel/phone — DOM 미표시 시 폴백",
+      "total_reviews_fallback": "<script> 임베드 JSON totalCount — DOM 합산 실패 시 폴백",
+      "category": "<script> 임베드 JSON category — DOM 패턴(place_name...알림받기) 구조 변경으로 불일치 시 폴백"
+    },
+    "gql_extracted": {
+      "rating": "pcmap-api.place.naver.com/graphql visitorReviewStats.review.avgRating — HTML 미추출 시 폴백",
+      "total_reviews": "GQL visitorReviewStats.review.totalCount 또는 visitorReviews.total — HTML 폴백 후 최종 폴백",
+      "visitor_review_count": "GQL visitorReviews.total — DOM 미추출 시 폴백",
+      "reply_rate": "GQL visitorReviews.items 집계 (reply.body 존재 비율 %) — DOM 미노출",
+      "receipt_review_ratio": "GQL visitorReviews.items 집계 (originType=영수증 비율 %) — DOM 미노출"
+    },
+    "dom_unextractable": {
+      "save_count": "DOM 미노출(저장 버튼 텍스트만, 숫자 없음). HTML <script> 태그에도 bookmarkCount/saveCnt 미포함. GQL 응답에도 미수신. 수집 불가.",
+      "category_dom": "정규식 {place_name}...알림받기 패턴 미매치 — DOM 구조 변경. HTML <script> JSON 폴백 사용."
+    }
+  },
+  "mapping": {
+    "place_name": "name",
+    "reservation_active": "booking_enabled",
+    "naver_pay_active": "naver_pay_enabled",
+    "talktalk_active": "naver_talk"
+  }
+}
