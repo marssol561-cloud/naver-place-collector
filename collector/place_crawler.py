@@ -45,6 +45,9 @@ PLACE_FIELDS = [
     "total_reviews",           # visitor + blog 합산 (DOM 도출 or GQL 폴백)
     "reply_rate",              # GQL visitorReviews 사장님 답변률 (%)
     "receipt_review_ratio",    # GQL visitorReviews 영수증 리뷰 비율 (%)
+    "good_point_votes",        # GQL visitorReviewStats.positiveKeywordCount
+    "feature_mentions",        # GQL visitorReviewStats.keywordList[].count 합산
+    "menu_mentions",           # GQL visitorReviewStats.menuList[].count 합산
 ]
 
 ADDRESS_PREFIXES = (
@@ -363,7 +366,7 @@ def _extract_gql_item(data: dict, out: dict, review_items: list):
     if not isinstance(data, dict):
         return
 
-    # visitorReviewStats → rating (avgRating), total_reviews (totalCount)
+    # visitorReviewStats → rating, total_reviews, good_point_votes, feature_mentions, menu_mentions
     if "visitorReviewStats" in data:
         stats = data["visitorReviewStats"]
         if isinstance(stats, dict):
@@ -378,6 +381,19 @@ def _extract_gql_item(data: dict, out: dict, review_items: list):
                             out.setdefault("rating", str(r))
                     except (TypeError, ValueError):
                         pass
+            pkc = stats.get("positiveKeywordCount")
+            if isinstance(pkc, int) and pkc > 0:
+                out.setdefault("good_point_votes", str(pkc))
+            kw_list = stats.get("keywordList") or []
+            if isinstance(kw_list, list) and kw_list:
+                kw_total = sum(item.get("count", 0) for item in kw_list if isinstance(item, dict))
+                if kw_total > 0:
+                    out.setdefault("feature_mentions", str(kw_total))
+            mn_list = stats.get("menuList") or []
+            if isinstance(mn_list, list) and mn_list:
+                mn_total = sum(item.get("count", 0) for item in mn_list if isinstance(item, dict))
+                if mn_total > 0:
+                    out.setdefault("menu_mentions", str(mn_total))
 
     # visitorReviews → items (reply_rate, receipt_review_ratio 계산용)
     if "visitorReviews" in data:
@@ -402,8 +418,9 @@ def _extract_gql_item(data: dict, out: dict, review_items: list):
 
 
 def _parse_gql_extras(gql_responses: list) -> dict:
-    """GraphQL 응답 목록 → 보강 5개 필드 반환
-    rating, save_count, total_reviews, reply_rate, receipt_review_ratio
+    """GraphQL 응답 목록 → 보강 8개 필드 반환
+    rating, save_count, total_reviews, reply_rate, receipt_review_ratio,
+    good_point_votes, feature_mentions, menu_mentions
     """
     out: dict = {}
     review_items: list = []
@@ -633,6 +650,9 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     result["visitor_review_count"] = gql_extras.get("visitor_review_total", "")
                 result["reply_rate"] = gql_extras.get("reply_rate", "")
                 result["receipt_review_ratio"] = gql_extras.get("receipt_review_ratio", "")
+                result["good_point_votes"] = gql_extras.get("good_point_votes", "")
+                result["feature_mentions"] = gql_extras.get("feature_mentions", "")
+                result["menu_mentions"] = gql_extras.get("menu_mentions", "")
 
                 # blog_review_count 계산 폴백 (totalCount - visitorReviews.total)
                 # totalCount (HTML) = 방문자 + 블로그 합산 / visitorReviews.total (GQL) = 방문자 전용
