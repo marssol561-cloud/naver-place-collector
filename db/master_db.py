@@ -107,6 +107,40 @@ def find_store_by_name_address(store_name: str, address: str) -> dict | None:
     return rows[0] if rows else None
 
 
+_STORE_ALLOWED_COLUMNS = frozenset({
+    "store_id", "place_id", "store_name", "address", "region", "is_registered",
+    "category", "rating", "total_reviews", "save_count", "reply_rate",
+    "receipt_review_ratio", "crawl_data", "crawled_at", "created_at", "updated_at",
+})
+
+_DEFAULT_GET_COLUMNS = [
+    "store_id", "place_id", "store_name", "address",
+    "rating", "reply_rate", "crawl_data", "crawled_at",
+]
+
+
+def find_store_by_id(store_id: str, columns: list[str] | None = None) -> dict | None:
+    """store_id(UUID)로 stores 조회. 없으면 None. columns 미지정 시 기본 칼럼 반환."""
+    if columns:
+        safe_cols = [c for c in columns if c in _STORE_ALLOWED_COLUMNS]
+        select_expr = ",".join(safe_cols) if safe_cols else ",".join(_DEFAULT_GET_COLUMNS)
+    else:
+        select_expr = ",".join(_DEFAULT_GET_COLUMNS)
+
+    resp = requests.get(
+        f"{MASTER_DB_URL}/rest/v1/stores",
+        params={
+            "select": select_expr,
+            "store_id": f"eq.{store_id}",
+        },
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
 def apply_field_mapping(raw: dict) -> dict:
     """place_crawler 원본 key → field_dictionary 표준 key 변환. 미매핑 key는 원본 유지."""
     return {_FIELD_MAPPING.get(k, k): v for k, v in raw.items()}

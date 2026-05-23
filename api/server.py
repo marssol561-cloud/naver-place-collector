@@ -1,5 +1,5 @@
 import time
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Depends, Request, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -103,6 +103,30 @@ async def _do_crawl_and_save(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "naver-place-collector", "version": "1.0.0"}
+
+
+@app.get("/api/v1/stores/{store_id}", dependencies=[Depends(verify_api_key)])
+async def get_store(
+    store_id: str,
+    fields: Optional[str] = Query(default=None, description="쉼표 구분 칼럼명"),
+):
+    columns = [f.strip() for f in fields.split(",")] if fields else None
+
+    try:
+        store = master_db.find_store_by_id(store_id, columns)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error_code": "DB_ERROR", "message": f"DB 조회 오류: {e}"},
+        )
+
+    if store is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "error_code": "STORE_NOT_FOUND", "message": f"store_id={store_id} 없음"},
+        )
+
+    return JSONResponse(content={"status": "ok", "store": store})
 
 
 @app.post("/api/v1/collect", dependencies=[Depends(verify_api_key)])
