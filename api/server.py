@@ -102,7 +102,7 @@ async def _do_crawl_and_save(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "naver-place-collector", "version": "1.0.0"}
+    return {"status": "ok", "service": "naver-place-collector", "version": "1.1.0"}
 
 
 @app.get("/api/v1/stores/{store_id}", dependencies=[Depends(verify_api_key)])
