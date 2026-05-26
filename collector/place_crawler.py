@@ -228,25 +228,31 @@ def clean_menu_name(raw: str) -> str:
 
 
 def compute_total_reviews(visitor: str, blog: str = "") -> str:
-    """전체리뷰 = 방문자리뷰 (블로그리뷰는 별도 카운트, 합산하지 않음)"""
+    """전체리뷰 = 방문자리뷰 + 블로그리뷰 (방문자/블로그는 별도 카테고리, 합산)
+    동암상회 예시: 490 + 185 = 675
+    """
     try:
         v = int((visitor or "0").replace(",", ""))
-        return str(v) if v > 0 else ""
+        b = int((blog or "0").replace(",", ""))
+        total = v + b
+        return str(total) if total > 0 else ""
     except (ValueError, AttributeError):
         return ""
 
 
 def compute_receipt_ratio(visitor: str, blog: str) -> str:
-    """영수증리뷰비율 = (방문자리뷰 - 블로그리뷰) / 방문자리뷰 × 100 (소수점 1자리)
-    - 블로그리뷰가 0이면 100.0
-    - visitor_review_count가 0이면 0 (0으로 나누기 방지)
+    """영수증리뷰비율 = visitor / (visitor + blog) × 100 (소수점 1자리)
+    방문자 리뷰와 블로그 리뷰는 별도 카테고리. 포함 관계가 아님.
+    동암상회 예시: 490 / (490 + 185) × 100 = 72.6%
+    - visitor + blog = 0 이면 0 반환 (0 나누기 방지)
     """
     try:
         v = int((visitor or "0").replace(",", ""))
         b = int((blog or "0").replace(",", ""))
-        if v == 0:
+        total = v + b
+        if total == 0:
             return "0"
-        ratio = (v - b) / v * 100
+        ratio = v / total * 100
         return str(round(ratio, 1))
     except (ValueError, AttributeError):
         return ""
@@ -264,11 +270,64 @@ def _extract_parking(text: str) -> str:
     return ""
 
 
+_PARKING_CODE_MAP = {
+    "no_parking": "주차불가",
+    "parking_available": "주차가능",
+    "free_parking": "무료주차",
+    "paid_parking": "유료주차",
+    "accessible_parking": "장애인주차가능",
+    "valet_parking": "발렛가능",
+    "valet_parking_available": "발렛가능",
+    "free_parking_available": "무료주차가능",
+    "paid_parking_available": "유료주차가능",
+}
+
+
+def _extract_parking_from_html(html: str) -> str:
+    """html_content Apollo State의 parkingInfo 구조에서 주차 정보 추출.
+    body_text에서 주차 텍스트를 찾지 못했을 때 폴백으로 호출한다.
+    - description: 점주가 직접 입력한 주차 안내 텍스트
+    - basicParking: 코드값 (no_parking → 주차불가 등)
+    - valetParking: 코드값 (발렛 여부)
+    """
+    if not html:
+        return ""
+    m = re.search(r'"parkingInfo"\s*:\s*\{([^}]{0,600})\}', html)
+    if not m:
+        return ""
+    block = m.group(1)
+
+    # description 우선 (직접 텍스트)
+    desc_m = re.search(r'"description"\s*:\s*"([^"]{1,100})"', block)
+    if desc_m and desc_m.group(1).strip():
+        return desc_m.group(1).strip()
+
+    # basicParking 코드 → 한국어
+    basic_m = re.search(r'"basicParking"\s*:\s*"([^"]+)"', block)
+    if basic_m:
+        code = basic_m.group(1).strip()
+        return _PARKING_CODE_MAP.get(code, code)
+
+    # valetParking 코드 → 한국어
+    valet_m = re.search(r'"valetParking"\s*:\s*"([^"]+)"', block)
+    if valet_m:
+        code = valet_m.group(1).strip()
+        return _PARKING_CODE_MAP.get(code, f"발렛({code})")
+
+    return ""
+
+
 def _extract_keywords_from_html(html: str) -> str:
-    """HTML <script> JSON에서 점주 대표 키워드 추출 (최대 5개, 쉼표 구분 반환)"""
+    """HTML <script> JSON에서 점주 대표 키워드 추출 (최대 5개, 쉼표 구분 반환).
+    탐색 순서:
+      1. keywordList  — Apollo State informationTab.keywordList (단순 문자열 배열)
+      2. representKeywords — 일부 플레이스 페이지 구조
+      3. keywords / tags — 기타 폴백
+    """
     if not html:
         return ""
     for pattern in [
+        r'"keywordList"\s*:\s*\[([^\]]{1,500})\]',         # 실제 Apollo State 키
         r'"representKeywords"\s*:\s*\[([^\]]{1,500})\]',
         r'"keywords"\s*:\s*\[([^\]]{1,500})\]',
         r'"tags"\s*:\s*\[([^\]]{1,500})\]',
@@ -276,7 +335,9 @@ def _extract_keywords_from_html(html: str) -> str:
         m = re.search(pattern, html)
         if m:
             block = m.group(1)
+            # 객체 배열 ("name" 키 포함)
             names = re.findall(r'"name"\s*:\s*"([^"]{1,30})"', block)
+            # 단순 문자열 배열 폴백 (keywordList 형식)
             if not names:
                 names = re.findall(r'"([가-힣a-zA-Z0-9 ]{1,20})"', block)
             names = [n.strip() for n in names if n.strip()][:5]
@@ -557,6 +618,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["directions"] = extract_directions(body_text)
                 result["total_reviews"] = compute_total_reviews(
                     result["visitor_review_count"],
+                    result["blog_review_count"],
                 )
                 # 스마트콜: 전화번호가 0507- 로 시작하면 Y, 아니면 N
                 if result["phone"]:
@@ -616,6 +678,10 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     if not result["keywords"]:
                         result["keywords"] = _extract_keywords_from_html(html_content)
 
+                    # parking: body_text에서 미추출 시 Apollo State parkingInfo 폴백
+                    if not result["parking"]:
+                        result["parking"] = _extract_parking_from_html(html_content)
+
                 # ── GQL 탭 이동 (메뉴 추출 전 실행 — entry_frame 직접 사용) ─────────────
                 # _find_entry_frame 재호출 없이 entry_frame 직접 사용 (메뉴 클릭 후 frame 상태 변경 방지)
                 # 홈: visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
@@ -634,6 +700,15 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         await page.wait_for_timeout(1000)
                         await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
                         await page.wait_for_timeout(3000)
+                    # 주차: /information 탭에서 추출 (body_text·HTML 폴백 모두 미추출 시)
+                    # goto /info → /home 리다이렉트(SPA 미지원). goto /information 은 정상 동작.
+                    if not result["parking"]:
+                        await entry_frame.goto(
+                            f"{_gql_base}/information", wait_until="networkidle", timeout=15_000
+                        )
+                        await page.wait_for_timeout(2000)
+                        _info_text = await entry_frame.locator("body").inner_text(timeout=5000)
+                        result["parking"] = _extract_parking(_info_text)
                 except Exception as _e:
                     print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
 
@@ -642,16 +717,19 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # visitor_review_count GQL 폴백 (DOM 미추출 시)
                 if not result["visitor_review_count"]:
                     result["visitor_review_count"] = gql_extras.get("visitor_review_total", "")
-                # total_reviews = visitor_review_count 동기화 (GQL 폴백 포함)
+                # total_reviews = visitor + blog (GQL 폴백 포함 — 재동기화)
                 if result["visitor_review_count"]:
-                    result["total_reviews"] = result["visitor_review_count"]
+                    result["total_reviews"] = compute_total_reviews(
+                        result["visitor_review_count"],
+                        result["blog_review_count"],
+                    )
                 elif not result["total_reviews"]:
                     result["total_reviews"] = gql_extras.get("visitor_review_total", "")
                 result["good_point_votes"] = gql_extras.get("good_point_votes", "")
                 result["feature_mentions"] = gql_extras.get("feature_mentions", "")
                 result["menu_mentions"] = gql_extras.get("menu_mentions", "")
 
-                # 영수증리뷰비율 계산: (방문자리뷰 - 블로그리뷰) / 방문자리뷰 × 100
+                # 영수증리뷰비율 계산: visitor / (visitor + blog) × 100
                 result["receipt_review_ratio"] = compute_receipt_ratio(
                     result["visitor_review_count"],
                     result["blog_review_count"],
