@@ -34,17 +34,14 @@ PLACE_FIELDS = [
     "photo_count",
     "visitor_review_count",
     "blog_review_count",
-    "rating",
-    "save_count",
     "reservation_active",
     "naver_pay_active",
     "coupon_active",
     "talktalk_active",
     "smartcall_active",
     "latest_news_date",
-    "total_reviews",           # visitor + blog 합산 (DOM 도출 or GQL 폴백)
-    "reply_rate",              # GQL visitorReviews 사장님 답변률 (%)
-    "receipt_review_ratio",    # GQL visitorReviews 영수증 리뷰 비율 (%)
+    "total_reviews",           # 방문자리뷰 = 전체리뷰 (visitor_review_count 그대로)
+    "receipt_review_ratio",    # (방문자리뷰 - 블로그리뷰) / 방문자리뷰 × 100
     "good_point_votes",        # GQL visitorReviewStats.positiveKeywordCount
     "feature_mentions",        # GQL visitorReviewStats.keywordList[].count 합산
     "menu_mentions",           # GQL visitorReviewStats.menuList[].count 합산
@@ -230,15 +227,62 @@ def clean_menu_name(raw: str) -> str:
     return f"[대표] {name}" if is_representative else name
 
 
-def compute_total_reviews(visitor: str, blog: str) -> str:
-    """방문자 + 블로그 리뷰 합산 — 두 값 모두 DOM에서 추출된 문자열"""
+def compute_total_reviews(visitor: str, blog: str = "") -> str:
+    """전체리뷰 = 방문자리뷰 (블로그리뷰는 별도 카운트, 합산하지 않음)"""
+    try:
+        v = int((visitor or "0").replace(",", ""))
+        return str(v) if v > 0 else ""
+    except (ValueError, AttributeError):
+        return ""
+
+
+def compute_receipt_ratio(visitor: str, blog: str) -> str:
+    """영수증리뷰비율 = (방문자리뷰 - 블로그리뷰) / 방문자리뷰 × 100 (소수점 1자리)
+    - 블로그리뷰가 0이면 100.0
+    - visitor_review_count가 0이면 0 (0으로 나누기 방지)
+    """
     try:
         v = int((visitor or "0").replace(",", ""))
         b = int((blog or "0").replace(",", ""))
-        total = v + b
-        return f"{total:,}" if total > 0 else ""
+        if v == 0:
+            return "0"
+        ratio = (v - b) / v * 100
+        return str(round(ratio, 1))
     except (ValueError, AttributeError):
         return ""
+
+
+def _extract_parking(text: str) -> str:
+    """주차 정보 추출. '주차불가' / '주차가능' / 'Y'(언급만 있고 구분 불명) 반환"""
+    compact = _compact_text(text)
+    if re.search(r"주차\s*불가", compact):
+        return "주차불가"
+    if re.search(r"주차\s*가능|주차장?\s*(?:있|보유)|발렛\s*파킹", compact):
+        return "주차가능"
+    if "주차" in compact:
+        return "Y"
+    return ""
+
+
+def _extract_keywords_from_html(html: str) -> str:
+    """HTML <script> JSON에서 점주 대표 키워드 추출 (최대 5개, 쉼표 구분 반환)"""
+    if not html:
+        return ""
+    for pattern in [
+        r'"representKeywords"\s*:\s*\[([^\]]{1,500})\]',
+        r'"keywords"\s*:\s*\[([^\]]{1,500})\]',
+        r'"tags"\s*:\s*\[([^\]]{1,500})\]',
+    ]:
+        m = re.search(pattern, html)
+        if m:
+            block = m.group(1)
+            names = re.findall(r'"name"\s*:\s*"([^"]{1,30})"', block)
+            if not names:
+                names = re.findall(r'"([가-힣a-zA-Z0-9 ]{1,20})"', block)
+            names = [n.strip() for n in names if n.strip()][:5]
+            if names:
+                return ", ".join(names)
+    return ""
 
 
 def extract_menu_items(text: str) -> str:
@@ -361,94 +405,50 @@ def _deep_find_gql(obj, key: str, depth: int = 0):
     return None
 
 
-def _extract_gql_item(data: dict, out: dict, review_items: list):
-    """단일 GraphQL data 항목에서 rating, total_reviews, save_count, 리뷰 목록 추출"""
+def _extract_gql_item(data: dict, out: dict):
+    """단일 GraphQL data 항목에서 good_point_votes, feature_mentions, menu_mentions,
+    visitor_review_total 추출. rating/save_count/reply_rate 는 수집 대상 제외."""
     if not isinstance(data, dict):
         return
 
-    # visitorReviewStats → rating, total_reviews, good_point_votes, feature_mentions, menu_mentions
-    if "visitorReviewStats" in data:
-        stats = data["visitorReviewStats"]
-        if isinstance(stats, dict):
-            rv = stats.get("review") or {}
-            if isinstance(rv, dict):
-                if rv.get("totalCount"):
-                    out.setdefault("total_reviews", str(rv["totalCount"]))
-                if rv.get("avgRating"):
-                    try:
-                        r = float(rv["avgRating"])
-                        if 1.0 <= r <= 5.0:
-                            out.setdefault("rating", str(r))
-                    except (TypeError, ValueError):
-                        pass
-            pkc = stats.get("positiveKeywordCount")
-            if isinstance(pkc, int) and pkc > 0:
-                out.setdefault("good_point_votes", str(pkc))
-            kw_list = stats.get("keywordList") or []
-            if isinstance(kw_list, list) and kw_list:
-                kw_total = sum(item.get("count", 0) for item in kw_list if isinstance(item, dict))
-                if kw_total > 0:
-                    out.setdefault("feature_mentions", str(kw_total))
-            mn_list = stats.get("menuList") or []
-            if isinstance(mn_list, list) and mn_list:
-                mn_total = sum(item.get("count", 0) for item in mn_list if isinstance(item, dict))
-                if mn_total > 0:
-                    out.setdefault("menu_mentions", str(mn_total))
+    # visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
+    stats = _deep_find_gql(data, "visitorReviewStats")
+    if stats is not None and isinstance(stats, dict):
+        pkc = stats.get("positiveKeywordCount")
+        if isinstance(pkc, int) and pkc > 0:
+            out.setdefault("good_point_votes", str(pkc))
+        kw_list = stats.get("keywordList") or []
+        if isinstance(kw_list, list) and kw_list:
+            kw_total = sum(item.get("count", 0) for item in kw_list if isinstance(item, dict))
+            if kw_total > 0:
+                out.setdefault("feature_mentions", str(kw_total))
+        mn_list = stats.get("menuList") or []
+        if isinstance(mn_list, list) and mn_list:
+            mn_total = sum(item.get("count", 0) for item in mn_list if isinstance(item, dict))
+            if mn_total > 0:
+                out.setdefault("menu_mentions", str(mn_total))
 
-    # visitorReviews → items (reply_rate, receipt_review_ratio 계산용)
-    if "visitorReviews" in data:
-        vr = data["visitorReviews"]
-        if isinstance(vr, dict):
-            if vr.get("total"):
-                if "total_reviews" not in out:
-                    out["total_reviews"] = str(vr["total"])
-                out.setdefault("visitor_review_total", str(vr["total"]))
-            items = vr.get("items") or []
-            if isinstance(items, list):
-                review_items.extend(items)
-
-    # save_count — bookmarkCount / wishCount / saveCnt / favoriteCount deep find
-    for bk_key in ("bookmarkCount", "wishCount", "saveCnt", "favoriteCount"):
-        val = _deep_find_gql(data, bk_key)
-        if isinstance(val, int) and val > 0:
-            cur = int(out.get("save_count") or "0")
-            if val > cur:
-                out["save_count"] = str(val)
-            break
+    # visitorReviews.total → visitor_review_total (방문자 전용 카운트)
+    vr = _deep_find_gql(data, "visitorReviews")
+    if vr is not None and isinstance(vr, dict):
+        if vr.get("total"):
+            out.setdefault("visitor_review_total", str(vr["total"]))
 
 
 def _parse_gql_extras(gql_responses: list) -> dict:
-    """GraphQL 응답 목록 → 보강 8개 필드 반환
-    rating, save_count, total_reviews, reply_rate, receipt_review_ratio,
-    good_point_votes, feature_mentions, menu_mentions
+    """GraphQL 응답 목록 → 보강 필드 반환
+    visitor_review_total, good_point_votes, feature_mentions, menu_mentions
+    (rating / save_count / reply_rate / receipt_review_ratio 는 수집 대상 제외)
     """
     out: dict = {}
-    review_items: list = []
 
     for resp in gql_responses:
         if isinstance(resp, list):
             for item in resp:
                 if isinstance(item, dict) and "data" in item:
-                    _extract_gql_item(item["data"], out, review_items)
+                    _extract_gql_item(item["data"], out)
         elif isinstance(resp, dict):
-            _extract_gql_item(resp, out, review_items)
-
-    # reply_rate, receipt_review_ratio: visitorReviews items 집계
-    if review_items:
-        total = len(review_items)
-        replied = sum(
-            1 for i in review_items
-            if isinstance(i, dict)
-            and i.get("reply")
-            and isinstance(i["reply"], dict)
-            and i["reply"].get("body")
-        )
-        receipt = sum(
-            1 for i in review_items
-            if isinstance(i, dict) and i.get("originType") == "영수증"
-        )
-        out["reply_rate"] = str(round(replied / total * 100))
-        out["receipt_review_ratio"] = str(round(receipt / total * 100))
+            _extract_gql_item(resp, out)
 
     return out
 
@@ -548,7 +548,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["closed_days"] = extract_closed_days(body_text)
                 result["visitor_review_count"] = _extract_review_count(body_text, "방문자")
                 result["blog_review_count"] = _extract_review_count(body_text, "블로그")
-                result["parking"] = extract_yes_no_keyword(body_text, "주차")
+                result["parking"] = _extract_parking(body_text)
                 result["takeout"] = extract_yes_no_keyword(body_text, "포장")
                 result["facilities"] = extract_facilities(body_text)
                 result["reservation_active"] = extract_yes_no_keyword(combined_text, "예약")
@@ -557,19 +557,14 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["directions"] = extract_directions(body_text)
                 result["total_reviews"] = compute_total_reviews(
                     result["visitor_review_count"],
-                    result["blog_review_count"],
                 )
+                # 스마트콜: 전화번호가 0507- 로 시작하면 Y, 아니면 N
+                if result["phone"]:
+                    result["smartcall_active"] = "Y" if result["phone"].startswith("0507-") else "N"
 
                 # ── HTML 임베드 JSON 보강 (place-revum/crawler naver_place.py 참조) ──────
                 # 봇 차단·DOM 패턴 불일치 시 <script> 태그 JSON에서 핵심 필드 추출
                 if html_content:
-                    if not result["rating"]:
-                        _m = re.search(r'"avgRating"\s*:\s*([\d.]+)', html_content)
-                        if _m:
-                            _v = float(_m.group(1))
-                            if 1.0 <= _v <= 5.0:
-                                result["rating"] = str(_v)
-
                     if not result["lot_address"]:
                         for _p in [r'"roadAddress"\s*:\s*"([^"]{5,100})"',
                                    r'"address"\s*:\s*"([^"]{5,100})"']:
@@ -584,24 +579,25 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                             _m = re.search(_p, html_content)
                             if _m:
                                 result["phone"] = _m.group(1)
+                                # 스마트콜 재판단 (HTML에서 전화번호 획득한 경우)
+                                result["smartcall_active"] = "Y" if result["phone"].startswith("0507-") else "N"
                                 break
 
-                    if not result["save_count"]:
-                        for _bk in ("bookmarkCount", "wishCount", "saveCnt", "favoriteCount"):
-                            _m = re.search(rf'"{_bk}"\s*:\s*(\d+)', html_content)
-                            if _m and int(_m.group(1)) > 0:
-                                result["save_count"] = _m.group(1)
-                                break
-
-                    if not result["total_reviews"]:
-                        _m = re.search(r'"totalCount"\s*:\s*(\d{2,})', html_content)
+                    if not result["visitor_review_count"]:
+                        _m = re.search(r'"visitorReviewCount"\s*:\s*(\d{2,})', html_content)
                         if _m and int(_m.group(1)) > 0:
-                            result["total_reviews"] = _m.group(1)
+                            result["visitor_review_count"] = _m.group(1)
 
                     if not result["category"]:
-                        _m = re.search(r'"category"\s*:\s*"([가-힣][가-힣a-zA-Z&·,\s/]{0,28})"', html_content)
-                        if _m:
-                            result["category"] = _m.group(1).strip()
+                        for _cat_p in [
+                            r'"category"\s*:\s*"([가-힣][가-힣a-zA-Z&·,\s/]{0,28})"',
+                            r'"categoryName"\s*:\s*"([가-힣][가-힣a-zA-Z&·,\s/]{0,28})"',
+                            r'"businessCategory"\s*:\s*"([가-힣][가-힣a-zA-Z&·,\s/]{0,28})"',
+                        ]:
+                            _m = re.search(_cat_p, html_content)
+                            if _m:
+                                result["category"] = _m.group(1).strip()
+                                break
 
                     if not result["blog_review_count"]:
                         _m = re.search(r'"blogReviewCount"\s*:\s*(\d+)', html_content)
@@ -617,10 +613,13 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                                 result["photo_count"] = _m.group(1)
                                 break
 
+                    if not result["keywords"]:
+                        result["keywords"] = _extract_keywords_from_html(html_content)
+
                 # ── GQL 탭 이동 (메뉴 추출 전 실행 — entry_frame 직접 사용) ─────────────
                 # _find_entry_frame 재호출 없이 entry_frame 직접 사용 (메뉴 클릭 후 frame 상태 변경 방지)
-                # 홈: avgRating(rating) + totalCount(total_reviews) GQL 확보
-                # 리뷰: visitorReviews items → reply_rate, receipt_review_ratio
+                # 홈: visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
+                # 리뷰: visitorReviews.total → visitor_review_total (방문자 전용 카운트 폴백)
                 try:
                     _m_pt = re.search(r"pcmap\.place\.naver\.com/([a-z]+)/", entry_frame.url)
                     _ptype = _m_pt.group(1) if _m_pt else "restaurant"
@@ -640,30 +639,23 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
 
                 # GQL 보강 필드 추출 및 병합
                 gql_extras = _parse_gql_extras(gql_responses)
-                if not result["rating"]:
-                    result["rating"] = gql_extras.get("rating", "")
-                if not result["save_count"]:
-                    result["save_count"] = gql_extras.get("save_count", "")
-                if not result["total_reviews"]:
-                    result["total_reviews"] = gql_extras.get("total_reviews", "")
+                # visitor_review_count GQL 폴백 (DOM 미추출 시)
                 if not result["visitor_review_count"]:
                     result["visitor_review_count"] = gql_extras.get("visitor_review_total", "")
-                result["reply_rate"] = gql_extras.get("reply_rate", "")
-                result["receipt_review_ratio"] = gql_extras.get("receipt_review_ratio", "")
+                # total_reviews = visitor_review_count 동기화 (GQL 폴백 포함)
+                if result["visitor_review_count"]:
+                    result["total_reviews"] = result["visitor_review_count"]
+                elif not result["total_reviews"]:
+                    result["total_reviews"] = gql_extras.get("visitor_review_total", "")
                 result["good_point_votes"] = gql_extras.get("good_point_votes", "")
                 result["feature_mentions"] = gql_extras.get("feature_mentions", "")
                 result["menu_mentions"] = gql_extras.get("menu_mentions", "")
 
-                # blog_review_count 계산 폴백 (totalCount - visitorReviews.total)
-                # totalCount (HTML) = 방문자 + 블로그 합산 / visitorReviews.total (GQL) = 방문자 전용
-                if not result["blog_review_count"] and result["total_reviews"] and result["visitor_review_count"]:
-                    try:
-                        _t = int(result["total_reviews"].replace(",", ""))
-                        _v = int(result["visitor_review_count"].replace(",", ""))
-                        if _t > _v > 0:
-                            result["blog_review_count"] = str(_t - _v)
-                    except (ValueError, AttributeError):
-                        pass
+                # 영수증리뷰비율 계산: (방문자리뷰 - 블로그리뷰) / 방문자리뷰 × 100
+                result["receipt_review_ratio"] = compute_receipt_ratio(
+                    result["visitor_review_count"],
+                    result["blog_review_count"],
+                )
 
                 # 메뉴 추출 (GQL 탭 이동 후 실행 — frame이 /review 상태, 메뉴 탭 클릭 가능)
                 result["menu_list"] = await _extract_menu_list_from_frame(page, entry_frame)
@@ -676,7 +668,6 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     result["blog_review_count"],
                     result["menu_list"],
                     result["total_reviews"],
-                    result["rating"],
                 ])
                 if not has_data:
                     print(f"[검색 실패] 점포 데이터 없음 (미등록 place_id): {place_id!r}")

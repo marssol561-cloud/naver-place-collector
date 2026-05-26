@@ -115,7 +115,7 @@ _STORE_ALLOWED_COLUMNS = frozenset({
 
 _DEFAULT_GET_COLUMNS = [
     "store_id", "place_id", "store_name", "address",
-    "rating", "reply_rate", "crawl_data", "crawled_at",
+    "crawl_data", "crawled_at",
 ]
 
 
