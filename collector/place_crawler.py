@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import sys
 import os
@@ -105,7 +106,7 @@ def extract_business_hours(text: str) -> str:
     )
     if not context:
         return ""
-    stop_markers = ["라스트오더", "전화번호", "홈페이지", "인스타그램", "편의", "AI 브리핑"]
+    stop_markers = ["라스트오더", "전화번호", "홈페이지", "인스타그램", "편의", "AI 브리핑", "펼쳐보기", "메뉴"]
     cut_points = [context.find(m) for m in stop_markers if context.find(m) > 0]
     if cut_points:
         context = context[: min(cut_points)].strip()
@@ -480,7 +481,10 @@ def _extract_gql_item(data: dict, out: dict):
             out.setdefault("good_point_votes", str(pkc))
         kw_list = stats.get("keywordList") or []
         if isinstance(kw_list, list) and kw_list:
-            kw_total = sum(item.get("count", 0) for item in kw_list if isinstance(item, dict))
+            kw_total = sum(
+                (item.get("count") or item.get("reviewCount") or 0)
+                for item in kw_list if isinstance(item, dict)
+            )
             if kw_total > 0:
                 out.setdefault("feature_mentions", str(kw_total))
         mn_list = stats.get("menuList") or []
@@ -512,6 +516,139 @@ def _parse_gql_extras(gql_responses: list) -> dict:
             _extract_gql_item(resp, out)
 
     return out
+
+
+# ── Apollo State HTML 파싱 폴백 (GQL 미수신 시) ─────────────────────────────
+# 홈 탭 Apollo State에서 good_point_votes / menu_mentions / feature_mentions 추출.
+# GQL이 정상 동작하면 이 함수들은 호출되지 않는다.
+
+def _extract_good_point_votes_from_html(html: str) -> str:
+    """Apollo State votedKeyword.details → JSON 배열 문자열 반환.
+    위치: VisitorReviewStatsResult:{place_id}.analysis.votedKeyword.details
+    저장형태: '[{"displayName": "음식이 맛있어요", "count": 452}, ...]'
+
+    GQL 기존 형태(positiveKeywordCount 단순 정수)와 다른 이유:
+    Apollo State는 details 배열만 제공하며 totalCount와 구분되는 positiveKeywordCount를
+    직접 노출하지 않음. 상세 배열이 더 완전한 데이터이므로 상세 형태 채택.
+
+    구현 방식: depth-tracking으로 details 배열 끝을 탐색.
+    "[^\\]]{0,8000}" 상한 방식은 항목이 많은 경우(30개 × ~350자 ≈ 10,500자) 실패하므로 사용하지 않음.
+    """
+    if not html:
+        return ""
+    # votedKeyword 위치 탐색
+    vk_idx = html.find('"votedKeyword"')
+    if vk_idx == -1:
+        return ""
+    # votedKeyword 이후 1500자 내에서 details 배열 시작([) 탐색
+    search_window = html[vk_idx: vk_idx + 1500]
+    det_m = re.search(r'"details"\s*:\s*\[', search_window)
+    if not det_m:
+        return ""
+    # html 내 배열 내부 시작 위치 ([ 다음)
+    arr_start = vk_idx + det_m.end()
+    # depth-tracking으로 배열 끝(]) 탐색 (최대 50,000자)
+    depth = 1
+    pos = arr_start
+    end = min(len(html), arr_start + 50_000)
+    while pos < end and depth > 0:
+        c = html[pos]
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+        pos += 1
+    block = html[arr_start: pos - 1]  # 닫는 ] 제외
+    # displayName → count 순서
+    items = re.findall(
+        r'"displayName"\s*:\s*"([^"]+)"[^}]*?"count"\s*:\s*(\d+)',
+        block,
+        re.DOTALL,
+    )
+    if not items:
+        # count → displayName 역순 대응
+        rev = re.findall(
+            r'"count"\s*:\s*(\d+)[^}]*?"displayName"\s*:\s*"([^"]+)"',
+            block,
+            re.DOTALL,
+        )
+        items = [(name, cnt) for cnt, name in rev]
+    if not items:
+        return ""
+    return json.dumps(
+        [{"displayName": name, "count": int(cnt)} for name, cnt in items],
+        ensure_ascii=False,
+    )
+
+
+def _extract_menu_mentions_from_html(html: str) -> str:
+    """Apollo State VisitorReviewStatsResult.analysis.menus → JSON 배열 문자열.
+    저장형태: '[{"label": "고기", "count": 70}, ...]'
+
+    주의: menus 키 중복 가능 → VisitorReviewStatsResult 블록 이후에서 탐색.
+    GQL 기존 형태(menuList count 합산 정수)와 다른 이유:
+    Apollo State menus 배열은 합산값이 아닌 개별 항목을 제공하므로 상세 형태 채택.
+    """
+    if not html:
+        return ""
+    vs_m = re.search(r'"VisitorReviewStatsResult:\d+"', html)
+    if not vs_m:
+        return ""
+    section = html[vs_m.start(): vs_m.start() + 20000]
+    m = re.search(r'"menus"\s*:\s*\[([^\]]{0,8000})\]', section)
+    if not m:
+        return ""
+    block = m.group(1)
+    items = re.findall(
+        r'"label"\s*:\s*"([^"]+)"[^}]*?"count"\s*:\s*(\d+)',
+        block,
+        re.DOTALL,
+    )
+    if not items:
+        rev = re.findall(
+            r'"count"\s*:\s*(\d+)[^}]*?"label"\s*:\s*"([^"]+)"',
+            block,
+            re.DOTALL,
+        )
+        items = [(label, cnt) for cnt, label in rev]
+    if not items:
+        return ""
+    return json.dumps(
+        [{"label": label, "count": int(cnt)} for label, cnt in items],
+        ensure_ascii=False,
+    )
+
+
+def _extract_feature_mentions_from_html(html: str) -> str:
+    """Apollo State VisitorReviewStatsResult.analysis.votedKeyword.details → count 합산.
+    GQL keywordList 미수신 시 폴백. details 배열 count 값 합산 → 정수 문자열 반환.
+    """
+    if not html:
+        return ""
+    vk_idx = html.find('"votedKeyword"')
+    if vk_idx == -1:
+        return ""
+    search_window = html[vk_idx: vk_idx + 1500]
+    det_m = re.search(r'"details"\s*:\s*\[', search_window)
+    if not det_m:
+        return ""
+    arr_start = vk_idx + det_m.end()
+    depth = 1
+    pos = arr_start
+    end = min(len(html), arr_start + 50_000)
+    while pos < end and depth > 0:
+        c = html[pos]
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+        pos += 1
+    block = html[arr_start: pos - 1]
+    counts = re.findall(r'"count"\s*:\s*(\d+)', block)
+    if not counts:
+        return ""
+    total = sum(int(c) for c in counts)
+    return str(total) if total > 0 else ""
 
 
 # ── 메인 수집 함수 ────────────────────────────────────────────────────────────
@@ -700,15 +837,18 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         await page.wait_for_timeout(1000)
                         await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
                         await page.wait_for_timeout(3000)
-                    # 주차: /information 탭에서 추출 (body_text·HTML 폴백 모두 미추출 시)
+                    # 주차·휴무일: /information 탭에서 추출 (body_text·HTML 폴백 모두 미추출 시)
                     # goto /info → /home 리다이렉트(SPA 미지원). goto /information 은 정상 동작.
-                    if not result["parking"]:
+                    if not result["parking"] or not result["closed_days"]:
                         await entry_frame.goto(
                             f"{_gql_base}/information", wait_until="networkidle", timeout=15_000
                         )
                         await page.wait_for_timeout(2000)
                         _info_text = await entry_frame.locator("body").inner_text(timeout=5000)
-                        result["parking"] = _extract_parking(_info_text)
+                        if not result["parking"]:
+                            result["parking"] = _extract_parking(_info_text)
+                        if not result["closed_days"]:
+                            result["closed_days"] = extract_closed_days(_info_text)
                 except Exception as _e:
                     print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
 
@@ -728,6 +868,15 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["good_point_votes"] = gql_extras.get("good_point_votes", "")
                 result["feature_mentions"] = gql_extras.get("feature_mentions", "")
                 result["menu_mentions"] = gql_extras.get("menu_mentions", "")
+
+                # ── Apollo State HTML 폴백 (GQL 미수신 시) ────────────────────
+                # html_content = 홈 탭 Apollo State (초기 로드 시 캡처, 세 필드 모두 포함 확인)
+                if not result["good_point_votes"] and html_content:
+                    result["good_point_votes"] = _extract_good_point_votes_from_html(html_content)
+                if not result["menu_mentions"] and html_content:
+                    result["menu_mentions"] = _extract_menu_mentions_from_html(html_content)
+                if not result["feature_mentions"] and html_content:
+                    result["feature_mentions"] = _extract_feature_mentions_from_html(html_content)
 
                 # 영수증리뷰비율 계산: visitor / (visitor + blog) × 100
                 result["receipt_review_ratio"] = compute_receipt_ratio(
