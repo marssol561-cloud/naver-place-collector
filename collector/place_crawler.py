@@ -134,7 +134,14 @@ def extract_break_time(text: str) -> str:
 
 
 def extract_closed_days(text: str) -> str:
-    return _context_after_marker(text, ["정기휴무", "연중무휴", "휴무", "매주"], 120)
+    context = _context_after_marker(text, ["정기휴무", "연중무휴", "휴무", "매주"], 120)
+    if not context:
+        return ""
+    stop_markers = ["접기", "메뉴", "전화번호", "홈페이지"]
+    cut_points = [context.find(m) for m in stop_markers if context.find(m) > 0]
+    if cut_points:
+        context = context[: min(cut_points)].strip()
+    return context[:120]
 
 
 def _extract_category(text: str, place_name: str) -> str:
@@ -829,6 +836,17 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     _gql_base = f"https://pcmap.place.naver.com/{_ptype}/{place_id}"
                     await entry_frame.goto(f"{_gql_base}/home", wait_until="networkidle", timeout=15_000)
                     await page.wait_for_timeout(1500)
+                    # 홈 탭 '펼쳐보기' 클릭 → 주간 영업시간/정기휴무 확장 (초기 body_text에는 축약본만 표시됨)
+                    if not result["closed_days"]:
+                        try:
+                            _expand_btn = entry_frame.get_by_role("button", name="펼쳐보기")
+                            if await _expand_btn.count() > 0:
+                                await _expand_btn.first.click(timeout=5000)
+                                await page.wait_for_timeout(1000)
+                                _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
+                                result["closed_days"] = extract_closed_days(_expanded_text)
+                        except Exception:
+                            pass
                     await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
                     await page.wait_for_timeout(3000)
                     # GQL 미수신 시 1회 재시도 (네트워크 지연 대응)
