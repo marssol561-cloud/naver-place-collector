@@ -144,6 +144,58 @@ def extract_closed_days(text: str) -> str:
     return context[:120]
 
 
+def _extract_business_hours_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 요일별 영업시간 구조화 추출.
+    요일+시간 패턴을 '월 HH:MM-HH:MM | 화 ... | 일 정기휴무(매주 일요일)' 형태로 반환.
+    """
+    DAYS_ORDER = ['월', '화', '수', '목', '금', '토', '일']
+    compact = _compact_text(expanded_text)
+    idx_h = compact.find('영업시간')
+    if idx_h == -1:
+        return ""
+    idx_end = compact.find('접기', idx_h)
+    section = compact[idx_h: idx_end] if idx_end != -1 else compact[idx_h: idx_h + 500]
+    day_pat = re.compile(
+        r'(월|화|수|목|금|토|일)\s+(\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}|정기휴무(?:\s*\([^)]+\))?)'
+    )
+    matches = day_pat.findall(section)
+    if not matches:
+        return ""
+    day_order = {d: i for i, d in enumerate(DAYS_ORDER)}
+    matches.sort(key=lambda x: day_order.get(x[0], 99))
+    parts = []
+    for day, hours in matches:
+        normalized = re.sub(r'\s*[-–]\s*', '-', hours.strip())
+        normalized = re.sub(r'\s+\(', '(', normalized)
+        parts.append(f"{day} {normalized}")
+    return " | ".join(parts)
+
+
+def _extract_closed_days_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 정기휴무 정보 추출 — 괄호 내 텍스트(매주 일요일)만 반환."""
+    compact = _compact_text(expanded_text)
+    m = re.search(r'정기휴무\s*\(([^)]+)\)', compact)
+    if m:
+        return m.group(1).strip()
+    if '연중무휴' in compact:
+        return '연중무휴'
+    return ""
+
+
+def _extract_description_from_info(info_text: str) -> str:
+    """정보탭 body_text에서 소개글 추출 (소개 섹션 헤딩 이후 ~ 펼쳐보기 이전)."""
+    for marker in ['\n소개\n', '소개\n']:
+        idx = info_text.find(marker)
+        if idx != -1:
+            content = info_text[idx + len(marker):]
+            stop_markers = ['펼쳐보기', '알고 계신', '정보 수정', '이용약관']
+            cut_points = [content.find(m) for m in stop_markers if content.find(m) > 0]
+            if cut_points:
+                content = content[:min(cut_points)]
+            return content.strip()
+    return ""
+
+
 def _extract_category(text: str, place_name: str) -> str:
     if not place_name:
         return ""
@@ -836,17 +888,21 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     _gql_base = f"https://pcmap.place.naver.com/{_ptype}/{place_id}"
                     await entry_frame.goto(f"{_gql_base}/home", wait_until="networkidle", timeout=15_000)
                     await page.wait_for_timeout(1500)
-                    # 홈 탭 '펼쳐보기' 클릭 → 주간 영업시간/정기휴무 확장 (초기 body_text에는 축약본만 표시됨)
-                    if not result["closed_days"]:
-                        try:
-                            _expand_btn = entry_frame.get_by_role("button", name="펼쳐보기")
-                            if await _expand_btn.count() > 0:
-                                await _expand_btn.first.click(timeout=5000)
-                                await page.wait_for_timeout(1000)
-                                _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
-                                result["closed_days"] = extract_closed_days(_expanded_text)
-                        except Exception:
-                            pass
+                    # 홈 탭 '펼쳐보기' 클릭 → 요일별 영업시간/정기휴무 전체 노출
+                    # 초기 body_text에는 상단 요약("영업 전 11:00에 영업 시작")만 표시됨
+                    try:
+                        _expand_btn = entry_frame.get_by_role("button", name="펼쳐보기")
+                        if await _expand_btn.count() > 0:
+                            await _expand_btn.first.click(timeout=5000)
+                            await page.wait_for_timeout(1000)
+                            _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
+                            _hours_structured = _extract_business_hours_from_expanded(_expanded_text)
+                            if _hours_structured:
+                                result["business_hours"] = _hours_structured
+                            if not result["closed_days"]:
+                                result["closed_days"] = _extract_closed_days_from_expanded(_expanded_text)
+                    except Exception:
+                        pass
                     await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
                     await page.wait_for_timeout(3000)
                     # GQL 미수신 시 1회 재시도 (네트워크 지연 대응)
@@ -855,9 +911,9 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         await page.wait_for_timeout(1000)
                         await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
                         await page.wait_for_timeout(3000)
-                    # 주차·휴무일: /information 탭에서 추출 (body_text·HTML 폴백 모두 미추출 시)
+                    # 주차·휴무일·소개: /information 탭에서 추출 (폴백)
                     # goto /info → /home 리다이렉트(SPA 미지원). goto /information 은 정상 동작.
-                    if not result["parking"] or not result["closed_days"]:
+                    if not result["parking"] or not result["closed_days"] or not result["description"]:
                         await entry_frame.goto(
                             f"{_gql_base}/information", wait_until="networkidle", timeout=15_000
                         )
@@ -867,6 +923,8 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                             result["parking"] = _extract_parking(_info_text)
                         if not result["closed_days"]:
                             result["closed_days"] = extract_closed_days(_info_text)
+                        if not result["description"]:
+                            result["description"] = _extract_description_from_info(_info_text)
                 except Exception as _e:
                     print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
 
