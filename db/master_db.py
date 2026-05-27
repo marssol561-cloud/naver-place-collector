@@ -109,7 +109,7 @@ def find_store_by_name_address(store_name: str, address: str) -> dict | None:
 
 _STORE_ALLOWED_COLUMNS = frozenset({
     "store_id", "place_id", "store_name", "address", "region", "is_registered",
-    "category", "rating", "total_reviews", "save_count", "reply_rate",
+    "industry", "category", "rating", "total_reviews", "save_count", "reply_rate",
     "receipt_review_ratio", "crawl_data", "crawled_at", "created_at", "updated_at",
 })
 
@@ -199,11 +199,14 @@ def upsert_store(
         rows = resp.json()
 
         if rows:
-            # 기존 레코드 → crawl_data만 UPDATE (트리거가 병합 + 핵심 6개 추출)
+            # 기존 레코드 → crawl_data + industry UPDATE
             store_id = rows[0]["store_id"]
             patch_body: dict = {"crawl_data": crawl_data}
             if region:
                 patch_body["region"] = region
+            industry = crawl_data.get("category")
+            if industry:
+                patch_body["industry"] = industry
             patch = requests.patch(
                 f"{base}?place_id=eq.{place_id}",
                 json=patch_body,
@@ -217,7 +220,42 @@ def upsert_store(
             log.info("UPDATE stores store_id=%s place_id=%s", store_id, place_id)
             return store_id, False
         else:
-            # 신규 → INSERT
+            # place_id 미등록 레코드가 이미 존재하면 INSERT 대신 UPDATE (중복 방지)
+            null_resp = requests.get(
+                base,
+                params={
+                    "select": "store_id",
+                    "store_name": f"eq.{store_name}",
+                    "place_id": "is.null",
+                },
+                headers=headers,
+                timeout=10,
+            )
+            null_resp.raise_for_status()
+            null_rows = null_resp.json()
+            if null_rows:
+                existing_id = null_rows[0]["store_id"]
+                upd: dict = {
+                    "place_id": place_id,
+                    "crawl_data": crawl_data,
+                    "is_registered": True,
+                }
+                if region:
+                    upd["region"] = region
+                industry = crawl_data.get("category")
+                if industry:
+                    upd["industry"] = industry
+                patch = requests.patch(
+                    f"{base}?store_id=eq.{existing_id}",
+                    json=upd,
+                    headers=headers,
+                    timeout=10,
+                )
+                patch.raise_for_status()
+                log.info("UPDATE(null→place_id) stores store_id=%s place_id=%s", existing_id, place_id)
+                return existing_id, False
+
+            # 진짜 신규 → INSERT
             body: dict = {
                 "place_id": place_id,
                 "store_name": store_name,
@@ -227,6 +265,9 @@ def upsert_store(
             }
             if region:
                 body["region"] = region
+            industry = crawl_data.get("category")
+            if industry:
+                body["industry"] = industry
             ins = requests.post(base, json=body, headers=headers, timeout=10)
             ins.raise_for_status()
             store_id = ins.json()[0]["store_id"]

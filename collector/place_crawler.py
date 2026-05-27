@@ -196,18 +196,33 @@ def _extract_description_from_info(info_text: str) -> str:
     return ""
 
 
+_CATEGORY_NOISE = ("페이지 닫기", "더보기", "이전 페이지")
+
+
 def _extract_category(text: str, place_name: str) -> str:
+    """place_name 바로 뒤 업종을 추출한다.
+
+    nav 영역(이전 페이지 > place_name > 페이지 닫기 > 더보기)이 먼저 등장하여
+    regex가 잘못된 구간을 캡처하는 것을 막기 위해 '더보기' 이후 구간만 검색한다.
+    """
     if not place_name:
         return ""
     compact = _compact_text(text)
+    # nav 영역 이후 구간만 검색 (더보기 이후)
+    moreidx = compact.find("더보기")
+    search_text = compact[moreidx:] if moreidx != -1 else compact
     match = re.search(
         rf"{re.escape(place_name)}\s*([가-힣A-Za-z,&·\s]+?)\s*알림받기",
-        compact,
+        search_text,
     )
     if not match:
         return ""
     category = match.group(1).strip()
-    return category if len(category) <= 30 else ""
+    if len(category) > 30:
+        return ""
+    if place_name in category or any(w in category for w in _CATEGORY_NOISE):
+        return ""
+    return category
 
 
 def _extract_place_name_from_text(text: str) -> str:
