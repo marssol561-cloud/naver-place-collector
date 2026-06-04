@@ -46,6 +46,8 @@ PLACE_FIELDS = [
     "good_point_votes",        # GQL visitorReviewStats.positiveKeywordCount
     "feature_mentions",        # GQL visitorReviewStats.keywordList[].count 합산
     "menu_mentions",           # GQL visitorReviewStats.menuList[].count 합산
+    "rating",                  # HTML avgRating / GQL visitorReviewStats.review.avgRating
+    "reply_rate",              # GQL visitorReviews.items reply.body 존재 비율 (0.00~1.00, 리뷰 0건→None)
 ]
 
 ADDRESS_PREFIXES = (
@@ -445,12 +447,18 @@ def extract_menu_items(text: str) -> str:
 
 def _find_entry_frame(page):
     """entryIframe 탐색 (page.frames 는 동기 프로퍼티)."""
+    # 1순위: /restaurant/ or /place/ URL 정확 매칭
     for frame in page.frames:
         if (
             "pcmap.place.naver.com" in frame.url
             and ("/restaurant/" in frame.url or "/place/" in frame.url)
         ):
             return frame
+    # 2순위: pcmap.place.naver.com 포함 모든 프레임 (카테고리 path 무관)
+    for frame in page.frames:
+        if "pcmap.place.naver.com" in frame.url and frame.url not in ("", "about:blank"):
+            return frame
+    # 3순위: frame name 매칭
     for frame in page.frames:
         if frame.name == "entryIframe":
             return frame
@@ -543,11 +551,11 @@ def _deep_find_gql(obj, key: str, depth: int = 0):
 
 def _extract_gql_item(data: dict, out: dict):
     """단일 GraphQL data 항목에서 good_point_votes, feature_mentions, menu_mentions,
-    visitor_review_total 추출. rating/save_count/reply_rate 는 수집 대상 제외."""
+    visitor_review_total, rating_gql, reply_rate, category_gql 추출."""
     if not isinstance(data, dict):
         return
 
-    # visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
+    # visitorReviewStats → good_point_votes, feature_mentions, menu_mentions, rating_gql
     stats = _deep_find_gql(data, "visitorReviewStats")
     if stats is not None and isinstance(stats, dict):
         pkc = stats.get("positiveKeywordCount")
@@ -566,18 +574,45 @@ def _extract_gql_item(data: dict, out: dict):
             mn_total = sum(item.get("count", 0) for item in mn_list if isinstance(item, dict))
             if mn_total > 0:
                 out.setdefault("menu_mentions", str(mn_total))
+        # visitorReviewStats.review.avgRating → rating_gql (HTML 미추출 시 폴백)
+        review_stat = stats.get("review") or {}
+        if isinstance(review_stat, dict):
+            avg = review_stat.get("avgRating")
+            if avg is not None:
+                try:
+                    out.setdefault("rating_gql", str(float(avg)))
+                except (TypeError, ValueError):
+                    pass
 
-    # visitorReviews.total → visitor_review_total (방문자 전용 카운트)
+    # visitorReviews → visitor_review_total, reply_rate
     vr = _deep_find_gql(data, "visitorReviews")
     if vr is not None and isinstance(vr, dict):
         if vr.get("total"):
             out.setdefault("visitor_review_total", str(vr["total"]))
+        # reply_rate: items 배열 reply.body 존재 비율 (리뷰 0건 → None)
+        items = vr.get("items")
+        if isinstance(items, list):
+            if items:
+                replied = sum(
+                    1 for r in items
+                    if isinstance(r, dict)
+                    and isinstance(r.get("reply"), dict)
+                    and r["reply"].get("body")
+                )
+                out.setdefault("reply_rate", round(replied / len(items), 2))
+            else:
+                out.setdefault("reply_rate", None)
+
+    # GQL category 탐색 (한국어 카테고리만 채택)
+    cat = _deep_find_gql(data, "category")
+    if isinstance(cat, str) and cat.strip() and re.search(r'[가-힣]', cat):
+        out.setdefault("category_gql", cat.strip()[:30])
 
 
 def _parse_gql_extras(gql_responses: list) -> dict:
     """GraphQL 응답 목록 → 보강 필드 반환
-    visitor_review_total, good_point_votes, feature_mentions, menu_mentions
-    (rating / save_count / reply_rate / receipt_review_ratio 는 수집 대상 제외)
+    visitor_review_total, good_point_votes, feature_mentions, menu_mentions,
+    rating_gql, reply_rate, category_gql (save_count 수집 불가)
     """
     out: dict = {}
 
@@ -725,6 +760,28 @@ def _extract_feature_mentions_from_html(html: str) -> str:
     return str(total) if total > 0 else ""
 
 
+def _extract_category_from_apollo(html: str) -> str:
+    """Apollo State PlaceDetailResult / PlaceHomeResult 앵커 기준 2000자 이내에서 category 탐색.
+    DOM → HTML → GQL 폴백 모두 실패 시 최종 단계로 호출된다.
+    """
+    if not html:
+        return ""
+    for anchor in ['"PlaceDetailResult', '"PlaceHomeResult', '"PlaceType']:
+        idx = html.find(anchor)
+        if idx != -1:
+            window = html[idx: idx + 2000]
+            for pat in [
+                r'"category"\s*:\s*"([가-힣][가-힣a-zA-Z&·,\s/]{1,25})"',
+                r'"categoryName"\s*:\s*"([가-힣][가-힣a-zA-Z&·,\s/]{1,25})"',
+            ]:
+                m = re.search(pat, window)
+                if m:
+                    val = m.group(1).strip()
+                    if val:
+                        return val
+    return ""
+
+
 # ── 메인 수집 함수 ────────────────────────────────────────────────────────────
 
 async def crawl_place_by_id(place_id: str) -> dict | None:
@@ -777,9 +834,17 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     print(f"[오류] entryIframe 로드 타임아웃: {place_id!r}")
                     return None
 
+                # iframe DOM은 존재하지만 frame URL 미로딩 대응 (Railway 환경 지연)
                 entry_frame = _find_entry_frame(page)
                 if entry_frame is None:
-                    print(f"[오류] entryIframe 탐색 실패: {place_id!r}")
+                    for _retry in range(12):  # 최대 6초 추가 대기
+                        await page.wait_for_timeout(500)
+                        entry_frame = _find_entry_frame(page)
+                        if entry_frame:
+                            break
+                if entry_frame is None:
+                    _frame_urls = [f.url for f in page.frames]
+                    print(f"[오류] entryIframe 탐색 실패: {place_id!r} | frames={_frame_urls[:5]}")
                     return None
 
                 try:
@@ -787,6 +852,25 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 except PlaywrightTimeoutError:
                     print(f"[오류] body 텍스트 추출 타임아웃: {place_id!r}")
                     return None
+
+                # ── Root Cause A guard (confirmed 2026-06-05) ────────────────────
+                # entryIframe can be captured mid-SPA-navigation before /home content
+                # loads (race condition) → body_text empty → all DOM extractors fail
+                # simultaneously. Observed intermittently on 2026-06-04 (6/29 saved).
+                # Phase 1 live run confirmed the normal snapshot is 1,673+ chars;
+                # a transitional/empty frame is near 0. Guard fires only when empty.
+                if len(body_text) < 200:
+                    print(f"[경고] 초기 body_text 빈 상태 ({len(body_text)}자) — networkidle 후 재캡처")
+                    try:
+                        await entry_frame.wait_for_load_state("networkidle", timeout=8000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    await page.wait_for_timeout(2000)
+                    try:
+                        body_text = await entry_frame.locator("body").inner_text(timeout=5000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    print(f"[재캡처] body_text 길이: {len(body_text)}")
 
                 # HTML 전체 스캔 (place-revum/crawler naver_place.py _extract_from_html 참조)
                 # <script> 태그 내 임베드 JSON 포함 — 봇 차단 시에도 데이터 보존됨
@@ -893,6 +977,15 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     if not result["parking"]:
                         result["parking"] = _extract_parking_from_html(html_content)
 
+                    # rating: HTML 임베드 JSON avgRating 추출 (신규 필드)
+                    if not result["rating"]:
+                        _m = re.search(r'"avgRating"\s*:\s*([\d.]+)', html_content)
+                        if _m:
+                            try:
+                                result["rating"] = str(float(_m.group(1)))
+                            except ValueError:
+                                pass
+
                 # ── GQL 탭 이동 (메뉴 추출 전 실행 — entry_frame 직접 사용) ─────────────
                 # _find_entry_frame 재호출 없이 entry_frame 직접 사용 (메뉴 클릭 후 frame 상태 변경 방지)
                 # 홈: visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
@@ -925,6 +1018,28 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         await entry_frame.goto(f"{_gql_base}/home", wait_until="networkidle", timeout=15_000)
                         await page.wait_for_timeout(1000)
                         await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
+                        await page.wait_for_timeout(3000)
+                    # Root Cause B guard: visitorReviewStats-specific retry
+                    # Mechanism (ii): the existing retry above guards total GQL absence only.
+                    # In Railway/slow environments gql_responses can be non-empty (visitorReviews
+                    # captured → visitor_review_count set) yet visitorReviewStats absent because
+                    # the /home 1500ms settle was too short. One targeted /home re-navigation with
+                    # a 3s settle fills this gap without touching working paths.
+                    _vrs_found = False
+                    for _r_b in gql_responses:
+                        _items_b = _r_b if isinstance(_r_b, list) else [_r_b]
+                        for _ib in _items_b:
+                            _d_b = _ib.get("data") if isinstance(_ib, dict) else _ib
+                            if _deep_find_gql(_d_b, "visitorReviewStats") is not None:
+                                _vrs_found = True
+                                break
+                        if _vrs_found:
+                            break
+                    if not _vrs_found:
+                        print("[경고] visitorReviewStats GQL 미수신 — /home 재시도 (3초 대기)")
+                        await entry_frame.goto(
+                            f"{_gql_base}/home", wait_until="networkidle", timeout=15_000
+                        )
                         await page.wait_for_timeout(3000)
                     # 주차·휴무일·소개: /information 탭에서 추출 (폴백)
                     # goto /info → /home 리다이렉트(SPA 미지원). goto /information 은 정상 동작.
@@ -959,6 +1074,15 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["good_point_votes"] = gql_extras.get("good_point_votes", "")
                 result["feature_mentions"] = gql_extras.get("feature_mentions", "")
                 result["menu_mentions"] = gql_extras.get("menu_mentions", "")
+                # reply_rate: GQL 집계 결과 병합 (float 또는 None — 키 존재 여부로 판별)
+                if "reply_rate" in gql_extras:
+                    result["reply_rate"] = gql_extras["reply_rate"]
+                # category GQL 폴백 (DOM → HTML 폴백 → GQL)
+                if not result["category"]:
+                    result["category"] = gql_extras.get("category_gql", "")
+                # rating GQL 폴백 (HTML → GQL)
+                if not result["rating"]:
+                    result["rating"] = gql_extras.get("rating_gql", "")
 
                 # ── Apollo State HTML 폴백 (GQL 미수신 시) ────────────────────
                 # html_content = 홈 탭 Apollo State (초기 로드 시 캡처, 세 필드 모두 포함 확인)
@@ -968,6 +1092,9 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     result["menu_mentions"] = _extract_menu_mentions_from_html(html_content)
                 if not result["feature_mentions"] and html_content:
                     result["feature_mentions"] = _extract_feature_mentions_from_html(html_content)
+                # category Apollo State 폴백 (DOM → HTML → GQL → Apollo State 최종 단계)
+                if not result["category"] and html_content:
+                    result["category"] = _extract_category_from_apollo(html_content)
 
                 # 영수증리뷰비율 계산: visitor / (visitor + blog) × 100
                 result["receipt_review_ratio"] = compute_receipt_ratio(
