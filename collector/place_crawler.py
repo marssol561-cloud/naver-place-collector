@@ -558,9 +558,20 @@ def _extract_gql_item(data: dict, out: dict):
     # visitorReviewStats → good_point_votes, feature_mentions, menu_mentions, rating_gql
     stats = _deep_find_gql(data, "visitorReviewStats")
     if stats is not None and isinstance(stats, dict):
-        pkc = stats.get("positiveKeywordCount")
-        if isinstance(pkc, int) and pkc > 0:
-            out.setdefault("good_point_votes", str(pkc))
+        _analysis = stats.get("analysis") or {}
+        # good_point_votes: analysis.votedKeyword.details → [{"displayName":..,"count":..}]
+        # GQL actual path confirmed 2026-06-05: visitorReviewStats.analysis.votedKeyword.details
+        _vk_details = (_analysis.get("votedKeyword") or {}).get("details") or []
+        if isinstance(_vk_details, list) and _vk_details:
+            _gpv_arr = [
+                {"displayName": it["displayName"], "count": it["count"]}
+                for it in _vk_details
+                if isinstance(it, dict)
+                and isinstance(it.get("displayName"), str)
+                and isinstance(it.get("count"), int)
+            ]
+            if _gpv_arr:
+                out.setdefault("good_point_votes", json.dumps(_gpv_arr, ensure_ascii=False))
         kw_list = stats.get("keywordList") or []
         if isinstance(kw_list, list) and kw_list:
             kw_total = sum(
@@ -569,11 +580,19 @@ def _extract_gql_item(data: dict, out: dict):
             )
             if kw_total > 0:
                 out.setdefault("feature_mentions", str(kw_total))
-        mn_list = stats.get("menuList") or []
-        if isinstance(mn_list, list) and mn_list:
-            mn_total = sum(item.get("count", 0) for item in mn_list if isinstance(item, dict))
-            if mn_total > 0:
-                out.setdefault("menu_mentions", str(mn_total))
+        # menu_mentions: analysis.menus → [{"label":..,"count":..}]
+        # GQL actual path confirmed 2026-06-05: visitorReviewStats.analysis.menus
+        _mn_menus = _analysis.get("menus") or []
+        if isinstance(_mn_menus, list) and _mn_menus:
+            _mm_arr = [
+                {"label": it["label"], "count": it["count"]}
+                for it in _mn_menus
+                if isinstance(it, dict)
+                and isinstance(it.get("label"), str)
+                and isinstance(it.get("count"), int)
+            ]
+            if _mm_arr:
+                out.setdefault("menu_mentions", json.dumps(_mm_arr, ensure_ascii=False))
         # visitorReviewStats.review.avgRating → rating_gql (HTML 미추출 시 폴백)
         review_stat = stats.get("review") or {}
         if isinstance(review_stat, dict):
