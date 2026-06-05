@@ -44,7 +44,6 @@ PLACE_FIELDS = [
     "coupon_active",
     "talktalk_active",
     "naver_features",
-    "order_enabled",                 # naver_features "주문" membership → bool (S2)
     "phone_reservation_enabled",
     "smartcall_active",
     "latest_news_date",
@@ -1264,7 +1263,6 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # come from naver_features membership to avoid text-match false positives.
                 _nf = _extract_naver_features(html_content) if html_content else []
                 result["naver_features"] = json.dumps(_nf, ensure_ascii=False)
-                result["order_enabled"] = "주문" in _nf          # bool: True if smart-order active
                 result["reservation_active"] = "Y" if "예약" in _nf else ""
                 result["naver_pay_active"] = "Y" if "페이" in _nf else ""
                 result["talktalk_active"] = "Y" if "톡톡" in _nf else ""
