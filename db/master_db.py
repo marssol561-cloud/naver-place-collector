@@ -201,10 +201,13 @@ def upsert_store(
         if rows:
             # 기존 레코드 → crawl_data + industry UPDATE
             store_id = rows[0]["store_id"]
-            patch_body: dict = {"crawl_data": crawl_data}
+            # Secondary guard (S2-FIX): exclude None/empty-string fields from PATCH so a
+            # failed-crawl null can never overwrite an existing good value via the merge trigger.
+            _safe_cd = {k: v for k, v in crawl_data.items() if v is not None and v != ""}
+            patch_body: dict = {"crawl_data": _safe_cd}
             if region:
                 patch_body["region"] = region
-            industry = crawl_data.get("category")
+            industry = _safe_cd.get("category")
             if industry:
                 patch_body["industry"] = industry
             patch = requests.patch(
@@ -235,14 +238,16 @@ def upsert_store(
             null_rows = null_resp.json()
             if null_rows:
                 existing_id = null_rows[0]["store_id"]
+                # Secondary guard: exclude None/empty-string fields from PATCH (S2-FIX)
+                _safe_cd2 = {k: v for k, v in crawl_data.items() if v is not None and v != ""}
                 upd: dict = {
                     "place_id": place_id,
-                    "crawl_data": crawl_data,
+                    "crawl_data": _safe_cd2,
                     "is_registered": True,
                 }
                 if region:
                     upd["region"] = region
-                industry = crawl_data.get("category")
+                industry = _safe_cd2.get("category")
                 if industry:
                     upd["industry"] = industry
                 patch = requests.patch(
@@ -300,6 +305,10 @@ async def save_to_master_db(store_name: str, address: str) -> dict:
         return {"store_id": store_id, "place_id": None, "is_new": is_new}
 
     raw = await place_crawler.crawl_place_by_id(place_id)
+    if raw == place_crawler.CRAWL_INCOMPLETE:
+        log.warning("불완전 렌더 place_id=%s — upsert 생략, DB 기존값 보존", place_id)
+        existing = find_store_by_place_id(place_id)
+        return {"store_id": existing["store_id"] if existing else None, "place_id": place_id, "is_new": False}
     if raw is None:
         log.warning("place_crawler 실패 place_id=%s → 빈 crawl_data로 저장", place_id)
         raw = {}

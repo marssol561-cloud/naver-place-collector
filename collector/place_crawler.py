@@ -1153,7 +1153,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # iframe DOM은 존재하지만 frame URL 미로딩 대응 (Railway 환경 지연)
                 entry_frame = _find_entry_frame(page)
                 if entry_frame is None:
-                    for _retry in range(12):  # 최대 6초 추가 대기
+                    for _poll in range(12):  # 최대 6초 추가 대기
                         await page.wait_for_timeout(500)
                         entry_frame = _find_entry_frame(page)
                         if entry_frame:
@@ -1169,24 +1169,54 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     print(f"[오류] body 텍스트 추출 타임아웃: {place_id!r}")
                     return None
 
-                # ── Root Cause A guard (confirmed 2026-06-05) ────────────────────
-                # entryIframe can be captured mid-SPA-navigation before /home content
-                # loads (race condition) → body_text empty → all DOM extractors fail
-                # simultaneously. Observed intermittently on 2026-06-04 (6/29 saved).
-                # Phase 1 live run confirmed the normal snapshot is 1,673+ chars;
-                # a transitional/empty frame is near 0. Guard fires only when empty.
-                if len(body_text) < 200:
-                    print(f"[경고] 초기 body_text 빈 상태 ({len(body_text)}자) - networkidle 후 재캡처")
+                # ── Render-completeness retry + PRIMARY GUARD (S2-FIX, 2026-06-06) ──
+                # S2-VERIFY measured: incomplete = 128 chars (2/3 runs), complete = 1,673+ chars.
+                # On each incomplete attempt: re-navigate up to _MAX_RENDER_RETRIES times.
+                # On persistent incomplete: return CRAWL_INCOMPLETE → caller performs NO upsert.
+                _MAX_RENDER_RETRIES = 3
+                for _retry_n in range(1, _MAX_RENDER_RETRIES + 1):
+                    if _is_render_complete(body_text):
+                        break
+                    print(
+                        f"[경고] 불완전 렌더 (재시도 {_retry_n}/{_MAX_RENDER_RETRIES}, "
+                        f"{len(body_text)}자 < {BODY_COMPLETENESS_THRESHOLD}자): {place_id!r}"
+                    )
+                    gql_responses.clear()
                     try:
-                        await entry_frame.wait_for_load_state("networkidle", timeout=8000)
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                     except PlaywrightTimeoutError:
-                        pass
-                    await page.wait_for_timeout(2000)
+                        print(f"[오류] 재시도 {_retry_n} 페이지 로드 타임아웃: {place_id!r}")
+                        break
+                    await page.wait_for_timeout(5000)
+                    try:
+                        await page.wait_for_selector("iframe#entryIframe", timeout=12_000)
+                    except PlaywrightTimeoutError:
+                        print(f"[오류] 재시도 {_retry_n} entryIframe 타임아웃: {place_id!r}")
+                        break
+                    entry_frame = _find_entry_frame(page)
+                    if entry_frame is None:
+                        for _poll in range(12):
+                            await page.wait_for_timeout(500)
+                            entry_frame = _find_entry_frame(page)
+                            if entry_frame:
+                                break
+                    if entry_frame is None:
+                        print(f"[오류] 재시도 {_retry_n} entryIframe 탐색 실패: {place_id!r}")
+                        break
                     try:
                         body_text = await entry_frame.locator("body").inner_text(timeout=5000)
                     except PlaywrightTimeoutError:
-                        pass
-                    print(f"[재캡처] body_text 길이: {len(body_text)}")
+                        print(f"[오류] 재시도 {_retry_n} body 텍스트 타임아웃: {place_id!r}")
+                        break
+                    print(f"[재시도 {_retry_n}] body_text 길이: {len(body_text)}자")
+
+                if not _is_render_complete(body_text):
+                    print(
+                        f"[CRAWL_INCOMPLETE] {_MAX_RENDER_RETRIES + 1}회 시도 후 불완전 렌더 "
+                        f"({len(body_text)}자 < {BODY_COMPLETENESS_THRESHOLD}자) — "
+                        f"place_id={place_id!r}. DB 기존 데이터 보존"
+                    )
+                    return CRAWL_INCOMPLETE  # type: ignore[return-value]
 
                 # HTML 전체 스캔 (place-revum/crawler naver_place.py _extract_from_html 참조)
                 # <script> 태그 내 임베드 JSON 포함 — 봇 차단 시에도 데이터 보존됨

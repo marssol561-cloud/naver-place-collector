@@ -79,6 +79,8 @@ async def _do_crawl_and_save(
     except Exception as e:
         return _error_resp("CRAWL_FAILED", f"크롤링 오류: {e}", start)
 
+    if raw == place_crawler.CRAWL_INCOMPLETE:
+        return _error_resp("CRAWL_INCOMPLETE", "불완전 렌더 — DB 기존 데이터 보존", start)
     if raw is None:
         return _error_resp("CRAWL_FAILED", "크롤링 실패 (데이터 없음)", start)
 
