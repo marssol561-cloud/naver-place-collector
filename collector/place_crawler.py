@@ -31,7 +31,7 @@ PLACE_FIELDS = [
     "takeout",
     "facilities",
     "menu_list",
-    "menu_photo_registered",         # Apollo State Menu:{place_id}_{N}.images non-empty (S5 신설)
+    "menu_image_registered",         # Apollo State Menu:{place_id}_{N}.images non-empty (S2)
     "keywords",
     "description",
     "ai_summary",
@@ -44,6 +44,7 @@ PLACE_FIELDS = [
     "coupon_active",
     "talktalk_active",
     "naver_features",
+    "order_enabled",                 # naver_features "주문" membership → bool (S2)
     "phone_reservation_enabled",
     "smartcall_active",
     "latest_news_date",
@@ -707,7 +708,7 @@ async def _click_menu_tab(frame) -> bool:
 
 
 async def _extract_menu_list_from_frame(page, frame) -> tuple[str, str]:
-    """Returns (menu_items_str, menu_frame_html). menu_html used for menu_photo_registered (S5)."""
+    """Returns (menu_items_str, menu_frame_html). menu_html used for menu_image_registered (S2)."""
     try:
         if not await _click_menu_tab(frame):
             return "", ""
@@ -1009,14 +1010,15 @@ def _extract_feature_mentions_from_html(html: str) -> str:
         return ""
 
 
-def _extract_menu_photo_flag_from_html(html: str, place_id: str) -> str:
-    """Apollo State Menu:{place_id}_{N}.images → "Y" if any menu item has a photo URL, else "".
+def _extract_menu_image_flag_from_html(html: str, place_id: str) -> bool:
+    """Apollo State Menu:{place_id}_{N}.images → True if any menu item has a photo URL, else False.
 
     Depth-tracks each Menu block's images array to find http/pstatic.net URLs.
-    No-photo path: images arrays are all empty ([]) or the key is absent → returns "".
+    No-photo path: images arrays are all empty ([]) or the key is absent → returns False.
+    Stored in crawl_data as JSON boolean true/false (sanitize_crawl_data passes booleans through).
     """
     if not html or not place_id:
-        return ""
+        return False
     anchor_pat = re.compile(rf'"Menu:{re.escape(place_id)}_\d+"')
     for anchor_m in anchor_pat.finditer(html):
         section_start = anchor_m.start()
@@ -1036,8 +1038,8 @@ def _extract_menu_photo_flag_from_html(html: str, place_id: str) -> str:
             pos += 1
         arr_content = html[arr_open + 1: pos - 1]
         if re.search(r'https?://|pstatic\.net', arr_content):
-            return "Y"
-    return ""
+            return True
+    return False
 
 
 def _extract_category_from_apollo(html: str) -> str:
@@ -1198,6 +1200,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # come from naver_features membership to avoid text-match false positives.
                 _nf = _extract_naver_features(html_content) if html_content else []
                 result["naver_features"] = json.dumps(_nf, ensure_ascii=False)
+                result["order_enabled"] = "주문" in _nf          # bool: True if smart-order active
                 result["reservation_active"] = "Y" if "예약" in _nf else ""
                 result["naver_pay_active"] = "Y" if "페이" in _nf else ""
                 result["talktalk_active"] = "Y" if "톡톡" in _nf else ""
@@ -1428,7 +1431,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # 메뉴 추출 (GQL 탭 이동 후 실행 — frame이 /review 상태, 메뉴 탭 클릭 가능)
                 _menu_list, _menu_html = await _extract_menu_list_from_frame(page, entry_frame)
                 result["menu_list"] = _menu_list
-                result["menu_photo_registered"] = _extract_menu_photo_flag_from_html(_menu_html, place_id)
+                result["menu_image_registered"] = _extract_menu_image_flag_from_html(_menu_html, place_id)
 
                 # 실제 점포 데이터가 없으면 실패로 처리
                 has_data = any([
