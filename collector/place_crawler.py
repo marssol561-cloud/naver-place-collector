@@ -63,6 +63,19 @@ ADDRESS_PREFIXES = (
     "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
 )
 
+# ── Render-completeness guard (S2-FIX, 2026-06-06) ───────────────────────────
+# S2-VERIFY measured: incomplete body_text = 128 chars (2/3 runs),
+# complete body_text = 1,673+ chars (Phase-1 confirmed).
+# 500 is conservative: well above 128, well below 1,673.
+BODY_COMPLETENESS_THRESHOLD = 500
+CRAWL_INCOMPLETE = "CRAWL_INCOMPLETE"
+
+
+def _is_render_complete(body_text: str) -> bool:
+    """True if body_text length indicates a fully-rendered entryIframe."""
+    return len(body_text) >= BODY_COMPLETENESS_THRESHOLD
+
+
 PRICE_PATTERN = re.compile(r"(?:(?:\d{1,3},)*\d{3,}|\d{4,})\s*원|변동")
 MENU_NOISE_WORDS = [
     "펼쳐보기", "접기", "주문", "사진", "리뷰", "메뉴", "정보", "홈", "소식",
@@ -494,6 +507,12 @@ def _extract_parking_info_from_html(html: str) -> dict:
     return out
 
 
+def _fac_norm_key(s: str) -> str:
+    """Normalize a facility label for dedup: strip trailing fee/note parenthetical, then collapse whitespace.
+    "무선인터넷"=="무선 인터넷"; "콜키지 가능 (유료)"→"콜키지가능" matches "콜키지 가능"→"콜키지가능"."""
+    return re.sub(r'\s+', '', re.sub(r'\s*\([^)]*\)\s*$', '', s))
+
+
 def _extract_facilities_from_info_html(html: str) -> list:
     """Extract facility labels from /information tab InformationFacilities objects.
 
@@ -501,13 +520,17 @@ def _extract_facilities_from_info_html(html: str) -> list:
     includes fee subtags where applicable (e.g., '콜키지 가능 (유료)').
     Confirmed via 금도야지 루원시티본점 (place_id 1256925027): id=201 name='콜키지 가능 (유료)'.
 
+    RC-2 (2026-06-06): numeric-ID filter (skips legacy string-keyed Apollo cache entries
+    that partial/stale hydration can emit) + _fac_norm_key dedup (treats
+    "무선인터넷"=="무선 인터넷"; prefers fee-tagged form, then longer form, then first seen).
+
     Structure: {"__typename":"InformationFacilities","id":"201","name":"콜키지 가능 (유료)","i18nName":"..."}
     No separate fee attribute — fee info is embedded in the name string.
     """
     if not html:
         return []
-    names = []
-    for m in re.finditer(r'"InformationFacilities:[^"]+"\s*:\s*\{', html):
+    names_raw = []
+    for m in re.finditer(r'"InformationFacilities:(\d+)"\s*:\s*\{', html):
         brace_start = m.end() - 1
         depth, end_pos = 0, brace_start
         for i in range(brace_start, min(brace_start + 1000, len(html))):
@@ -523,12 +546,23 @@ def _extract_facilities_from_info_html(html: str) -> list:
             block = json.loads(block_str)
             name = block.get("name", "")
             if isinstance(name, str) and name.strip():
-                names.append(name.strip())
+                names_raw.append(name.strip())
         except (json.JSONDecodeError, ValueError):
             nm = re.search(r'"name"\s*:\s*"([^"]{1,80})"', block_str)
             if nm:
-                names.append(nm.group(1).strip())
-    return names
+                names_raw.append(nm.group(1).strip())
+    seen: dict = {}
+    for name in names_raw:
+        nk = _fac_norm_key(name)
+        if nk not in seen:
+            seen[nk] = name
+        else:
+            existing = seen[nk]
+            if '(' in name and '(' not in existing:
+                seen[nk] = name  # fee-tagged beats plain
+            elif '(' not in name and '(' not in existing and len(name) > len(existing):
+                seen[nk] = name  # longer (spaced) form beats collapsed
+    return list(seen.values())
 
 
 # ── S3: Naver platform feature detection (DECLARATIVE) ───────────────────────
@@ -1362,11 +1396,22 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         _pinfo = _extract_parking_info_from_html(_info_html)
                         result["parking_description"] = _pinfo.get("description", "")
                         result["parking_is_free"] = _pinfo.get("is_free", "")
-                        # facilities upgrade: InformationFacilities.name includes fee subtags
-                        # (e.g., '콜키지 가능 (유료)'), unlike home-tab conveniences plain labels.
+                        # RC-3 (2026-06-06): normalized merge — INFO fee tags upgrade CONV labels;
+                        # CONV backfills items absent from a partial InformationFacilities cache.
                         _info_fac = _extract_facilities_from_info_html(_info_html)
                         if _info_fac:
-                            result["facilities"] = json.dumps(_info_fac, ensure_ascii=False)
+                            _info_d = {_fac_norm_key(x): x for x in _info_fac}
+                            _merged, _seen_nk = [], set()
+                            for _item in (_conv or []):
+                                _nk = _fac_norm_key(_item)
+                                if _nk not in _seen_nk:
+                                    _merged.append(_info_d.get(_nk, _item))
+                                    _seen_nk.add(_nk)
+                            for _nk, _lbl in _info_d.items():
+                                if _nk not in _seen_nk:
+                                    _merged.append(_lbl)
+                                    _seen_nk.add(_nk)
+                            result["facilities"] = json.dumps(_merged, ensure_ascii=False)
                 except Exception as _e:
                     print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
 
