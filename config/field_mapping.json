@@ -26,6 +26,8 @@
       "talktalk_active (Apollo State talktalkUrl 비null/비empty — 확인됨)",
       "naver_features (Apollo State: 예약=naverBookingUrl비null / 주문=naverOrder.isPickup|isTableOrder|isPreOrder:true / 배달=isDelivery:true / 톡톡=talktalkUrl비empty)",
       "phone_reservation_enabled (InformationFacilities id=1 '예약' 항목 존재 여부)",
+      "menu_image_registered (Apollo State Menu:{place_id}_{N}.images 비어 있지 않음 — bool S2)",
+      "order_enabled (naver_features '주문' 포함 여부 — bool, labels.order 동치 — S2)",
       "smartcall_active (스마트콜 버튼/링크 텍스트)",
       "latest_news_date (소식 날짜 패턴)"
     ],
