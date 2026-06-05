@@ -31,6 +31,7 @@ PLACE_FIELDS = [
     "takeout",
     "facilities",
     "menu_list",
+    "menu_photo_registered",         # Apollo State Menu:{place_id}_{N}.images non-empty (S5 신설)
     "keywords",
     "description",
     "ai_summary",
@@ -705,24 +706,29 @@ async def _click_menu_tab(frame) -> bool:
     return False
 
 
-async def _extract_menu_list_from_frame(page, frame) -> str:
+async def _extract_menu_list_from_frame(page, frame) -> tuple[str, str]:
+    """Returns (menu_items_str, menu_frame_html). menu_html used for menu_photo_registered (S5)."""
     try:
         if not await _click_menu_tab(frame):
-            return ""
+            return "", ""
         await page.wait_for_timeout(3000)
         menu_frame = _find_entry_frame(page)
         if menu_frame is None:
             print("[메뉴] entryIframe 탐색 실패 (메뉴 탭 클릭 후)")
-            return ""
+            return "", ""
         await menu_frame.locator("body").evaluate("el => el.scrollBy(0, 800)")
         await page.wait_for_timeout(1000)
         body_text = await menu_frame.locator("body").inner_text(timeout=5000)
         if "/menu" not in menu_frame.url and not PRICE_PATTERN.search(body_text):
-            return ""
-        return extract_menu_items(body_text)
+            return "", ""
+        try:
+            menu_html = await menu_frame.content()
+        except Exception:
+            menu_html = ""
+        return extract_menu_items(body_text), menu_html
     except Exception as exc:
         print(f"[메뉴] 추출 실패: {exc}")
-        return ""
+        return "", ""
 
 
 # ── GraphQL 인터셉트 보강 (place-revum/crawler/graphql_interceptor.py 참조) ──
@@ -1001,6 +1007,37 @@ def _extract_feature_mentions_from_html(html: str) -> str:
         return str(total) if total > 0 else ""
     except Exception:
         return ""
+
+
+def _extract_menu_photo_flag_from_html(html: str, place_id: str) -> str:
+    """Apollo State Menu:{place_id}_{N}.images → "Y" if any menu item has a photo URL, else "".
+
+    Depth-tracks each Menu block's images array to find http/pstatic.net URLs.
+    No-photo path: images arrays are all empty ([]) or the key is absent → returns "".
+    """
+    if not html or not place_id:
+        return ""
+    anchor_pat = re.compile(rf'"Menu:{re.escape(place_id)}_\d+"')
+    for anchor_m in anchor_pat.finditer(html):
+        section_start = anchor_m.start()
+        section = html[section_start: section_start + 3000]
+        img_key_m = re.search(r'"images"\s*:\s*\[', section)
+        if not img_key_m:
+            continue
+        arr_open = section_start + img_key_m.end() - 1  # position of '['
+        depth, pos = 1, arr_open + 1
+        end = min(len(html), arr_open + 10000)
+        while pos < end and depth > 0:
+            c = html[pos]
+            if c == '[':
+                depth += 1
+            elif c == ']':
+                depth -= 1
+            pos += 1
+        arr_content = html[arr_open + 1: pos - 1]
+        if re.search(r'https?://|pstatic\.net', arr_content):
+            return "Y"
+    return ""
 
 
 def _extract_category_from_apollo(html: str) -> str:
@@ -1389,7 +1426,9 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 )
 
                 # 메뉴 추출 (GQL 탭 이동 후 실행 — frame이 /review 상태, 메뉴 탭 클릭 가능)
-                result["menu_list"] = await _extract_menu_list_from_frame(page, entry_frame)
+                _menu_list, _menu_html = await _extract_menu_list_from_frame(page, entry_frame)
+                result["menu_list"] = _menu_list
+                result["menu_photo_registered"] = _extract_menu_photo_flag_from_html(_menu_html, place_id)
 
                 # 실제 점포 데이터가 없으면 실패로 처리
                 has_data = any([
