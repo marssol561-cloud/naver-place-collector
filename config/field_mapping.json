@@ -20,10 +20,12 @@
       "photo_count (이미지 갯수 / img[alt] 수)",
       "visitor_review_count (방문자 리뷰 N 패턴)",
       "blog_review_count (블로그 리뷰 N 패턴)",
-      "reservation_active (예약 버튼/링크 텍스트)",
-      "naver_pay_active (네이버페이 버튼/링크 텍스트)",
+      "reservation_active (Apollo State PlaceDetailNaverBooking.naverBookingUrl 비null — S3R 수정: hasNaverReservation 항상 false였음)",
+      "naver_pay_active (naver_features '페이' — S3R 미구현: npay 글로벌 템플릿, 점포별 시그널 미확인)",
       "coupon_active (쿠폰 버튼/링크 텍스트)",
-      "talktalk_active (톡톡 버튼/링크 텍스트)",
+      "talktalk_active (Apollo State talktalkUrl 비null/비empty — 확인됨)",
+      "naver_features (Apollo State: 예약=naverBookingUrl비null / 주문=naverOrder.isPickup|isTableOrder|isPreOrder:true / 배달=isDelivery:true / 톡톡=talktalkUrl비empty)",
+      "phone_reservation_enabled (InformationFacilities id=1 '예약' 항목 존재 여부)",
       "smartcall_active (스마트콜 버튼/링크 텍스트)",
       "latest_news_date (소식 날짜 패턴)"
     ],
@@ -50,6 +52,7 @@
     "place_name": "name",
     "reservation_active": "booking_enabled",
     "naver_pay_active": "naver_pay_enabled",
-    "talktalk_active": "naver_talk"
+    "talktalk_active": "naver_talk",
+    "phone_reservation_enabled": "phone_reservation_enabled"
   }
 }

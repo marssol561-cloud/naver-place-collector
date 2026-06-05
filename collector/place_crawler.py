@@ -26,11 +26,14 @@ PLACE_FIELDS = [
     "last_order",
     "closed_days",
     "parking",
+    "parking_description",
+    "parking_is_free",
     "takeout",
     "facilities",
     "menu_list",
     "keywords",
     "description",
+    "ai_summary",
     "directions",
     "photo_count",
     "visitor_review_count",
@@ -39,13 +42,16 @@ PLACE_FIELDS = [
     "naver_pay_active",
     "coupon_active",
     "talktalk_active",
+    "naver_features",
+    "phone_reservation_enabled",
     "smartcall_active",
     "latest_news_date",
     "total_reviews",           # 방문자리뷰 = 전체리뷰 (visitor_review_count 그대로)
     "receipt_review_ratio",    # (방문자리뷰 - 블로그리뷰) / 방문자리뷰 × 100
-    "good_point_votes",        # GQL visitorReviewStats.positiveKeywordCount
-    "feature_mentions",        # GQL visitorReviewStats.keywordList[].count 합산
-    "menu_mentions",           # GQL visitorReviewStats.menuList[].count 합산
+    "good_point_votes",        # GQL visitorReviewStats.analysis.votedKeyword.details → [{displayName,count}]
+    "feature_mentions",        # GQL visitorReviewStats.analysis.themes[].count 합산 (S4: keywordList→themes)
+    "feature_themes",          # GQL visitorReviewStats.analysis.themes → [{label,count}] (S4 신설)
+    "menu_mentions",           # GQL visitorReviewStats.analysis.menus → [{label,count}]
     "rating",                  # HTML avgRating / GQL visitorReviewStats.review.avgRating
     "reply_rate",              # GQL visitorReviews.items reply.body 존재 비율 (0.00~1.00, 리뷰 0건→None)
 ]
@@ -360,6 +366,51 @@ _PARKING_CODE_MAP = {
 }
 
 
+def _extract_ai_summary_from_html(html: str) -> str:
+    """Home Apollo State PlaceDetailBase.microReviews[0] — AI 요약 한 줄 텍스트.
+
+    Apollo State JSON uses Unicode escapes (e.g. \\u002F for '/'); json.loads decodes
+    them properly. Falls back to raw regex extraction if JSON parse fails.
+    """
+    if not html:
+        return ""
+    m = re.search(r'"microReviews"\s*:\s*\[([^\]]{1,500})\]', html)
+    if not m:
+        return ""
+    try:
+        items = json.loads(f'[{m.group(1)}]')
+        return str(items[0]).strip() if items else ""
+    except (json.JSONDecodeError, ValueError, IndexError):
+        first = re.search(r'"([^"]{1,200})"', m.group(1))
+        return first.group(1).strip() if first else ""
+
+
+def _extract_conveniences_from_html(html: str, exclude: list | None = None) -> list:
+    """Home Apollo State PlaceDetailBase.conveniences — 편의시설 레이블 배열.
+
+    Apollo State JSON uses Unicode escapes (e.g. \\u002F for '/'); wrapping the
+    captured bracket content in json.loads decodes all escapes correctly.
+    Falls back to raw regex if JSON parse fails.
+
+    NOTE: conveniences items are plain label strings — no fee/paid attribute is
+    present here. '콜키지 가능(유료)' style subtags live in the InformationFacilities
+    individual item objects (information tab Apollo State), not in conveniences.
+    """
+    if not html:
+        return []
+    m = re.search(r'"conveniences"\s*:\s*\[([^\]]{1,2000})\]', html)
+    if not m:
+        return []
+    try:
+        items = json.loads(f'[{m.group(1)}]')
+    except (json.JSONDecodeError, ValueError):
+        items = re.findall(r'"([^"]{1,50})"', m.group(1))
+    items = [str(item) for item in items if isinstance(item, str)]
+    if exclude:
+        items = [item for item in items if item not in exclude]
+    return items
+
+
 def _extract_parking_from_html(html: str) -> str:
     """html_content Apollo State의 parkingInfo 구조에서 주차 정보 추출.
     body_text에서 주차 텍스트를 찾지 못했을 때 폴백으로 호출한다.
@@ -392,6 +443,152 @@ def _extract_parking_from_html(html: str) -> str:
         return _PARKING_CODE_MAP.get(code, f"발렛({code})")
 
     return ""
+
+
+def _extract_parking_info_from_html(html: str) -> dict:
+    """Extract nested parkingInfo block from /information tab Apollo State.
+
+    Returns {description, is_free} where is_free is "Y"/"N"/"".
+    Uses depth-tracking to handle the nested basicParking sub-object, which breaks
+    the flat-block regex in _extract_parking_from_html.
+
+    어반정원 example:
+      description = "평일: 반달로14번길 월미공원 후문 무료주차 가능\\n주말: 공영주차장 이용"
+      is_free     = "Y"  (basicParking.isFree: true)
+    """
+    if not html:
+        return {}
+    m = re.search(r'"parkingInfo"\s*:\s*\{', html)
+    if not m:
+        return {}
+    start = m.end() - 1  # points at '{'
+    depth, end_pos = 0, start
+    for i in range(start, min(start + 5000, len(html))):
+        if html[i] == '{':
+            depth += 1
+        elif html[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end_pos = i + 1
+                break
+    block_str = html[start:end_pos]
+    try:
+        block = json.loads(block_str)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+    out: dict = {}
+    desc = block.get("description") or ""
+    if isinstance(desc, str) and desc.strip():
+        out["description"] = desc.strip()
+
+    basic = block.get("basicParking") or {}
+    is_free = basic.get("isFree") if isinstance(basic, dict) else None
+    if is_free is True:
+        out["is_free"] = "Y"
+    elif is_free is False:
+        out["is_free"] = "N"
+
+    return out
+
+
+def _extract_facilities_from_info_html(html: str) -> list:
+    """Extract facility labels from /information tab InformationFacilities objects.
+
+    Unlike the home-tab conveniences array (plain labels), InformationFacilities.name
+    includes fee subtags where applicable (e.g., '콜키지 가능 (유료)').
+    Confirmed via 금도야지 루원시티본점 (place_id 1256925027): id=201 name='콜키지 가능 (유료)'.
+
+    Structure: {"__typename":"InformationFacilities","id":"201","name":"콜키지 가능 (유료)","i18nName":"..."}
+    No separate fee attribute — fee info is embedded in the name string.
+    """
+    if not html:
+        return []
+    names = []
+    for m in re.finditer(r'"InformationFacilities:[^"]+"\s*:\s*\{', html):
+        brace_start = m.end() - 1
+        depth, end_pos = 0, brace_start
+        for i in range(brace_start, min(brace_start + 1000, len(html))):
+            if html[i] == '{':
+                depth += 1
+            elif html[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end_pos = i + 1
+                    break
+        block_str = html[brace_start:end_pos]
+        try:
+            block = json.loads(block_str)
+            name = block.get("name", "")
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+        except (json.JSONDecodeError, ValueError):
+            nm = re.search(r'"name"\s*:\s*"([^"]{1,80})"', block_str)
+            if nm:
+                names.append(nm.group(1).strip())
+    return names
+
+
+# ── S3: Naver platform feature detection (DECLARATIVE) ───────────────────────
+
+def _check_naver_reservation(html: str) -> bool:
+    """Non-null naverBookingUrl in PlaceDetailNaverBooking (Naver table reservation).
+    hasNaverReservation is always false even for active stores; naverBookingUrl is store-specific.
+    Known miss: 호시카츠 서울역 본점 (1587635202) — bookingBusinessId=null, no naverBookingUrl.
+    Uses non-Naver-Booking reservation (no Apollo State signal). Deferred per S3 Final."""
+    return bool(re.search(r'"naverBookingUrl"\s*:\s*"[^"]+"', html))
+
+
+def _naverorder_block(html: str) -> str:
+    """Depth-extract naverOrder {...} block; returns '' if absent or null."""
+    m = re.search(r'"naverOrder"\s*:\s*\{', html)
+    if not m:
+        return ""
+    start = m.end() - 1
+    depth, end_pos = 0, start
+    for i in range(start, min(start + 2000, len(html))):
+        if html[i] == '{':
+            depth += 1
+        elif html[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end_pos = i + 1
+                break
+    return html[start:end_pos]
+
+
+def _check_naver_order(html: str) -> bool:
+    """naverOrder has at least one active order type (isPickup/isTableOrder/isPreOrder = true).
+    naverOrder exists for many stores with empty items; must confirm actual activity."""
+    blk = _naverorder_block(html)
+    return bool(re.search(r'"(?:isPickup|isTableOrder|isPreOrder)"\s*:\s*true', blk))
+
+
+def _check_naver_delivery(html: str) -> bool:
+    """naverOrder.isDelivery == true (delivery via Naver Order system)."""
+    blk = _naverorder_block(html)
+    return bool(re.search(r'"isDelivery"\s*:\s*true', blk))
+
+
+def _check_talktalk(html: str) -> bool:
+    """talktalkUrl is a non-null, non-empty string in Apollo State."""
+    return bool(re.search(r'"talktalkUrl"\s*:\s*"[^"]+"', html))
+
+
+# Declarative list — one entry per Naver feature. Add new entries here.
+# 페이 (Naver Pay): npay Apollo object is a global page template, NOT store-specific.
+# No reliable store-specific signal confirmed as of S3. Excluded until confirmed.
+_NAVER_FEATURE_DETECTORS: list[tuple] = [
+    ("예약", _check_naver_reservation),
+    ("주문", _check_naver_order),
+    ("배달", _check_naver_delivery),
+    ("톡톡", _check_talktalk),
+]
+
+
+def _extract_naver_features(html: str) -> list[str]:
+    """Return list of active Naver platform feature labels for the given home-tab HTML."""
+    return [label for label, check in _NAVER_FEATURE_DETECTORS if check(html)]
 
 
 def _extract_keywords_from_html(html: str) -> str:
@@ -572,14 +769,22 @@ def _extract_gql_item(data: dict, out: dict):
             ]
             if _gpv_arr:
                 out.setdefault("good_point_votes", json.dumps(_gpv_arr, ensure_ascii=False))
-        kw_list = stats.get("keywordList") or []
-        if isinstance(kw_list, list) and kw_list:
-            kw_total = sum(
-                (item.get("count") or item.get("reviewCount") or 0)
-                for item in kw_list if isinstance(item, dict)
-            )
-            if kw_total > 0:
-                out.setdefault("feature_mentions", str(kw_total))
+        # analysis.themes → feature_themes array + feature_mentions sum (S4)
+        # Replaces keywordList aggregation (was mis-aggregating votedKeyword counts).
+        _themes = _analysis.get("themes") or []
+        if isinstance(_themes, list) and _themes:
+            _th_arr = [
+                {"label": it["label"], "count": it["count"]}
+                for it in _themes
+                if isinstance(it, dict)
+                and isinstance(it.get("label"), str)
+                and isinstance(it.get("count"), int)
+            ]
+            if _th_arr:
+                out.setdefault("feature_themes", json.dumps(_th_arr, ensure_ascii=False))
+                th_total = sum(t["count"] for t in _th_arr)
+                if th_total > 0:
+                    out.setdefault("feature_mentions", str(th_total))
         # menu_mentions: analysis.menus → [{"label":..,"count":..}]
         # GQL actual path confirmed 2026-06-05: visitorReviewStats.analysis.menus
         _mn_menus = _analysis.get("menus") or []
@@ -630,7 +835,7 @@ def _extract_gql_item(data: dict, out: dict):
 
 def _parse_gql_extras(gql_responses: list) -> dict:
     """GraphQL 응답 목록 → 보강 필드 반환
-    visitor_review_total, good_point_votes, feature_mentions, menu_mentions,
+    visitor_review_total, good_point_votes, feature_themes, feature_mentions, menu_mentions,
     rating_gql, reply_rate, category_gql (save_count 수집 불가)
     """
     out: dict = {}
@@ -747,36 +952,55 @@ def _extract_menu_mentions_from_html(html: str) -> str:
     )
 
 
-def _extract_feature_mentions_from_html(html: str) -> str:
-    """Apollo State VisitorReviewStatsResult.analysis.votedKeyword.details → count 합산.
-    GQL keywordList 미수신 시 폴백. details 배열 count 값 합산 → 정수 문자열 반환.
+def _extract_feature_themes_from_html(html: str) -> str:
+    """Apollo State VisitorReviewStatsResult.analysis.themes → JSON 배열 문자열.
+    저장형태: '[{"label": "맛", "count": 717}, ...]'
+    GQL analysis.themes 미수신 시 폴백. _extract_menu_mentions_from_html 패턴 미러.
     """
     if not html:
         return ""
-    vk_idx = html.find('"votedKeyword"')
-    if vk_idx == -1:
+    vs_m = re.search(r'"VisitorReviewStatsResult:\d+"', html)
+    if not vs_m:
         return ""
-    search_window = html[vk_idx: vk_idx + 1500]
-    det_m = re.search(r'"details"\s*:\s*\[', search_window)
-    if not det_m:
+    section = html[vs_m.start(): vs_m.start() + 20000]
+    m = re.search(r'"themes"\s*:\s*\[([^\]]{0,8000})\]', section)
+    if not m:
         return ""
-    arr_start = vk_idx + det_m.end()
-    depth = 1
-    pos = arr_start
-    end = min(len(html), arr_start + 50_000)
-    while pos < end and depth > 0:
-        c = html[pos]
-        if c == '[':
-            depth += 1
-        elif c == ']':
-            depth -= 1
-        pos += 1
-    block = html[arr_start: pos - 1]
-    counts = re.findall(r'"count"\s*:\s*(\d+)', block)
-    if not counts:
+    block = m.group(1)
+    items = re.findall(
+        r'"label"\s*:\s*"([^"]+)"[^}]*?"count"\s*:\s*(\d+)',
+        block,
+        re.DOTALL,
+    )
+    if not items:
+        rev = re.findall(
+            r'"count"\s*:\s*(\d+)[^}]*?"label"\s*:\s*"([^"]+)"',
+            block,
+            re.DOTALL,
+        )
+        items = [(label, cnt) for cnt, label in rev]
+    if not items:
         return ""
-    total = sum(int(c) for c in counts)
-    return str(total) if total > 0 else ""
+    return json.dumps(
+        [{"label": label, "count": int(cnt)} for label, cnt in items],
+        ensure_ascii=False,
+    )
+
+
+def _extract_feature_mentions_from_html(html: str) -> str:
+    """Apollo State VisitorReviewStatsResult.analysis.themes → count 합산.
+    GQL analysis.themes 미수신 시 폴백. themes 배열 count 합산 → 정수 문자열 반환.
+    S4: votedKeyword.details 합산에서 analysis.themes 합산으로 수정.
+    """
+    themes_json = _extract_feature_themes_from_html(html)
+    if not themes_json:
+        return ""
+    try:
+        themes = json.loads(themes_json)
+        total = sum(t.get("count", 0) for t in themes if isinstance(t, dict))
+        return str(total) if total > 0 else ""
+    except Exception:
+        return ""
 
 
 def _extract_category_from_apollo(html: str) -> str:
@@ -879,7 +1103,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # Phase 1 live run confirmed the normal snapshot is 1,673+ chars;
                 # a transitional/empty frame is near 0. Guard fires only when empty.
                 if len(body_text) < 200:
-                    print(f"[경고] 초기 body_text 빈 상태 ({len(body_text)}자) — networkidle 후 재캡처")
+                    print(f"[경고] 초기 body_text 빈 상태 ({len(body_text)}자) - networkidle 후 재캡처")
                     try:
                         await entry_frame.wait_for_load_state("networkidle", timeout=8000)
                     except PlaywrightTimeoutError:
@@ -925,8 +1149,21 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["blog_review_count"] = _extract_review_count(body_text, "블로그")
                 result["parking"] = _extract_parking(body_text)
                 result["takeout"] = extract_yes_no_keyword(body_text, "포장")
-                result["facilities"] = extract_facilities(body_text)
-                result["reservation_active"] = extract_yes_no_keyword(combined_text, "예약")
+                # facilities: Apollo State conveniences array preferred (JSON array string,
+                # excludes "주차" which is a separate 편의시설 섹션). Fall back to text-blob.
+                _conv = _extract_conveniences_from_html(html_content, exclude=["주차"])
+                if _conv:
+                    result["facilities"] = json.dumps(_conv, ensure_ascii=False)
+                else:
+                    result["facilities"] = extract_facilities(body_text)
+                # naver_features: Naver platform features from home-tab Apollo State.
+                # Derived fields (reservation_active, talktalk_active, naver_pay_active)
+                # come from naver_features membership to avoid text-match false positives.
+                _nf = _extract_naver_features(html_content) if html_content else []
+                result["naver_features"] = json.dumps(_nf, ensure_ascii=False)
+                result["reservation_active"] = "Y" if "예약" in _nf else ""
+                result["naver_pay_active"] = "Y" if "페이" in _nf else ""
+                result["talktalk_active"] = "Y" if "톡톡" in _nf else ""
                 result["coupon_active"] = extract_yes_no_keyword(combined_text, "쿠폰")
                 result["photo_count"] = extract_photo_count(body_text, img_count)
                 result["directions"] = extract_directions(body_text)
@@ -996,6 +1233,10 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     if not result["parking"]:
                         result["parking"] = _extract_parking_from_html(html_content)
 
+                    # ai_summary: Home Apollo State microReviews[0]
+                    if not result["ai_summary"]:
+                        result["ai_summary"] = _extract_ai_summary_from_html(html_content)
+
                     # rating: HTML 임베드 JSON avgRating 추출 (신규 필드)
                     if not result["rating"]:
                         _m = re.search(r'"avgRating"\s*:\s*([\d.]+)', html_content)
@@ -1055,12 +1296,14 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         if _vrs_found:
                             break
                     if not _vrs_found:
-                        print("[경고] visitorReviewStats GQL 미수신 — /home 재시도 (3초 대기)")
+                        print("[경고] visitorReviewStats GQL 미수신 - /home 재시도 (3초 대기)")
                         await entry_frame.goto(
                             f"{_gql_base}/home", wait_until="networkidle", timeout=15_000
                         )
                         await page.wait_for_timeout(3000)
-                    # 주차·휴무일·소개: /information 탭에서 추출 (폴백)
+                    # 주차·휴무일·소개 + parking_description/parking_is_free/facilities:
+                    # /information 탭에서 추출 (폴백 + 신규 필드).
+                    # description은 항상 "" 상태로 시작 → 조건 항상 True → /information 항상 탐색.
                     # goto /info → /home 리다이렉트(SPA 미지원). goto /information 은 정상 동작.
                     if not result["parking"] or not result["closed_days"] or not result["description"]:
                         await entry_frame.goto(
@@ -1068,14 +1311,35 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         )
                         await page.wait_for_timeout(2000)
                         _info_text = await entry_frame.locator("body").inner_text(timeout=5000)
+                        _info_html = await entry_frame.content()
                         if not result["parking"]:
                             result["parking"] = _extract_parking(_info_text)
                         if not result["closed_days"]:
                             result["closed_days"] = extract_closed_days(_info_text)
                         if not result["description"]:
                             result["description"] = _extract_description_from_info(_info_text)
+                        # parking_description / parking_is_free (always — new fields)
+                        _pinfo = _extract_parking_info_from_html(_info_html)
+                        result["parking_description"] = _pinfo.get("description", "")
+                        result["parking_is_free"] = _pinfo.get("is_free", "")
+                        # facilities upgrade: InformationFacilities.name includes fee subtags
+                        # (e.g., '콜키지 가능 (유료)'), unlike home-tab conveniences plain labels.
+                        _info_fac = _extract_facilities_from_info_html(_info_html)
+                        if _info_fac:
+                            result["facilities"] = json.dumps(_info_fac, ensure_ascii=False)
                 except Exception as _e:
                     print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
+
+                # phone_reservation_enabled: "예약" in facilities list.
+                # InformationFacilities id=1 ("예약") signals general reservation acceptance.
+                # Falls back to home-tab conveniences if /information tab was skipped.
+                if result.get("facilities"):
+                    try:
+                        result["phone_reservation_enabled"] = (
+                            "Y" if "예약" in json.loads(result["facilities"]) else ""
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        pass
 
                 # GQL 보강 필드 추출 및 병합
                 gql_extras = _parse_gql_extras(gql_responses)
@@ -1091,6 +1355,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 elif not result["total_reviews"]:
                     result["total_reviews"] = gql_extras.get("visitor_review_total", "")
                 result["good_point_votes"] = gql_extras.get("good_point_votes", "")
+                result["feature_themes"] = gql_extras.get("feature_themes", "")
                 result["feature_mentions"] = gql_extras.get("feature_mentions", "")
                 result["menu_mentions"] = gql_extras.get("menu_mentions", "")
                 # reply_rate: GQL 집계 결과 병합 (float 또는 None — 키 존재 여부로 판별)
@@ -1109,6 +1374,8 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     result["good_point_votes"] = _extract_good_point_votes_from_html(html_content)
                 if not result["menu_mentions"] and html_content:
                     result["menu_mentions"] = _extract_menu_mentions_from_html(html_content)
+                if not result["feature_themes"] and html_content:
+                    result["feature_themes"] = _extract_feature_themes_from_html(html_content)
                 if not result["feature_mentions"] and html_content:
                     result["feature_mentions"] = _extract_feature_mentions_from_html(html_content)
                 # category Apollo State 폴백 (DOM → HTML → GQL → Apollo State 최종 단계)

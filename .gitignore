@@ -16,3 +16,41 @@ starbucks_*.html
 test_criteria_16.py
 test_crit10.py
 check_crawl_data.py
+
+# ── temp / debug / sprint artifacts (pre-S2, 2026-06-05) ──────────────────
+# backup snapshots
+backup_*.json
+backup_*.py
+
+# debug / inspect / verify one-off scripts
+debug_*.py
+inspect_*.py
+verify_*.py
+live_verify.py
+check_kangnam.py
+
+# sprint rootcause / phase scripts
+phase3_rootcause_b.py
+s3_final_phase34.py
+s4_test_feature_themes.py
+trace_gql_b.py
+
+# sprint output text files
+*_out.txt
+
+# sprint JSON artifacts
+gql_vrs_structure.json
+trace_gql_b_results.json
+
+# untracked sprint test scripts
+test_array_normalize.py
+test_s1_ai_summary_facilities.py
+test_s2_parking_facilities_fee.py
+test_s3_naver_features.py
+test_s3r2_validate.py
+
+# untracked session logs (committed tracked log: session_log_crawldata_parking_keyword_20260527.md)
+session_log_20260528*.md
+
+# DB migration files (applied via Supabase dashboard; not repo-managed)
+db/migrations/
