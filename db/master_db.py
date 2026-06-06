@@ -319,6 +319,22 @@ def upsert_business_images(store_id: str, place_id: str, image_urls: list, busin
     log.info("upsert_business_images store_id=%s urls=%d count=%s", store_id, len(image_urls), business_photo_count)
 
 
+def get_business_images(store_id: str) -> dict | None:
+    """store_id로 store_business_images 조회. 없으면 None."""
+    resp = requests.get(
+        f"{MASTER_DB_URL}/rest/v1/store_business_images",
+        params={
+            "select": "image_urls,business_photo_count,captured_at",
+            "store_id": f"eq.{store_id}",
+        },
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
 async def save_to_master_db(store_name: str, address: str) -> dict:
     """searcher + place_crawler + key 변환 + upsert 전체 흐름"""
     place_id = await searcher.search_place_id(store_name, address)

@@ -132,7 +132,12 @@ async def get_store(
             content={"status": "error", "error_code": "STORE_NOT_FOUND", "message": f"store_id={store_id} 없음"},
         )
 
-    return JSONResponse(content={"status": "ok", "store": store})
+    try:
+        business_images = master_db.get_business_images(store_id)
+    except Exception:
+        business_images = None
+
+    return JSONResponse(content={"status": "ok", "store": store, "business_images": business_images})
 
 
 @app.post("/api/v1/collect", dependencies=[Depends(verify_api_key)])
