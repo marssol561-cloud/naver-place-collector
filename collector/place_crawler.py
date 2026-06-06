@@ -1075,6 +1075,40 @@ def _extract_menu_image_flag_from_html(html: str, place_id: str) -> bool:
     return False
 
 
+def _extract_business_image_urls(html: str) -> tuple[list, object]:
+    """Apollo State images({"source":["starbucks","tpirates"]}) → (top-5 origin URLs, totalImages).
+    URL field: Image.origin (raw ldb-phinf, \\u002F decoded). Array order = display order.
+    Returns ([], None) if key absent.
+    """
+    if not html:
+        return [], None
+    key_pat = re.compile(r'"images\((?:[^"\\]|\\.)*\)"\s*:\s*\{')
+    for key_m in key_pat.finditer(html):
+        key_str = html[key_m.start(): key_m.start() + 200]
+        if "starbucks" not in key_str or "tpirates" not in key_str:
+            continue
+        block_start = key_m.end() - 1
+        depth, pos = 1, block_start + 1
+        end_limit = min(len(html), block_start + 60000)
+        while pos < end_limit and depth:
+            if html[pos] == '{':
+                depth += 1
+            elif html[pos] == '}':
+                depth -= 1
+            pos += 1
+        block_str = html[block_start:pos]
+        total_m = re.search(r'"totalImages"\s*:\s*(\d+)', block_str)
+        total = int(total_m.group(1)) if total_m else None
+        origins = []
+        for om in re.finditer(r'"origin"\s*:\s*"([^"]+)"', block_str):
+            url = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), om.group(1))
+            url = url.replace('\\/', '/')
+            if 'ldb-phinf' in url or 'pstatic.net' in url:
+                origins.append(url)
+        return origins[:5], total
+    return [], None
+
+
 def _extract_category_from_apollo(html: str) -> str:
     """Apollo State PlaceDetailResult / PlaceHomeResult 앵커 기준 2000자 이내에서 category 탐색.
     DOM → HTML → GQL 폴백 모두 실패 시 최종 단계로 호출된다.
@@ -1505,6 +1539,10 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 _menu_list, _menu_html = await _extract_menu_list_from_frame(page, entry_frame)
                 result["menu_list"] = _menu_list
                 result["menu_image_registered"] = _extract_menu_image_flag_from_html(_menu_html, place_id)
+
+                _biz_urls, _biz_count = _extract_business_image_urls(html_content)
+                result["business_image_urls"] = _biz_urls
+                result["business_photo_count"] = _biz_count
 
                 # 실제 점포 데이터가 없으면 실패로 처리
                 has_data = any([

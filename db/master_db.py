@@ -295,6 +295,30 @@ def upsert_store(
         return store_id, True
 
 
+def upsert_business_images(store_id: str, place_id: str, image_urls: list, business_photo_count) -> None:
+    """Satellite upsert: store_business_images. Overwrites on conflict (PK=store_id)."""
+    from datetime import datetime, timezone
+    headers = {
+        "apikey": MASTER_DB_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {MASTER_DB_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+    }
+    body = {
+        "store_id": store_id,
+        "place_id": place_id,
+        "image_urls": json.dumps(image_urls, ensure_ascii=False),
+        "business_photo_count": business_photo_count,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    resp = requests.post(
+        f"{MASTER_DB_URL}/rest/v1/store_business_images",
+        json=body, headers=headers, timeout=10,
+    )
+    resp.raise_for_status()
+    log.info("upsert_business_images store_id=%s urls=%d count=%s", store_id, len(image_urls), business_photo_count)
+
+
 async def save_to_master_db(store_name: str, address: str) -> dict:
     """searcher + place_crawler + key 변환 + upsert 전체 흐름"""
     place_id = await searcher.search_place_id(store_name, address)
@@ -315,7 +339,11 @@ async def save_to_master_db(store_name: str, address: str) -> dict:
 
     mapped = apply_field_mapping(raw)
     mapped = sanitize_crawl_data(mapped)
+    _biz_urls  = mapped.pop("business_image_urls", []) or []
+    _biz_count = mapped.pop("business_photo_count", None)
     store_id, is_new = upsert_store(place_id, store_name, address, mapped)
+    if _biz_urls or _biz_count is not None:
+        upsert_business_images(store_id, place_id, _biz_urls, _biz_count)
     return {"store_id": store_id, "place_id": place_id, "is_new": is_new}
 
 
