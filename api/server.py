@@ -89,6 +89,11 @@ async def _do_crawl_and_save(
         mapped = master_db.sanitize_crawl_data(mapped)
         _biz_urls  = mapped.pop("business_image_urls", []) or []
         _biz_count = mapped.pop("business_photo_count", None)
+        # Backfill empty store_name/address from crawled data (place_id-only path)
+        if not store_name:
+            store_name = mapped.get("name") or ""
+        if not address:
+            address = (mapped.get("lot_address") or mapped.get("lot_address_fallback") or "")
         region = master_db.extract_region(address)
         store_id, _ = master_db.upsert_store(place_id, store_name, address, mapped, region)
         if _biz_urls or _biz_count is not None:
