@@ -87,8 +87,12 @@ async def _do_crawl_and_save(
     try:
         mapped = master_db.apply_field_mapping(raw)
         mapped = master_db.sanitize_crawl_data(mapped)
+        _biz_urls  = mapped.pop("business_image_urls", []) or []
+        _biz_count = mapped.pop("business_photo_count", None)
         region = master_db.extract_region(address)
         store_id, _ = master_db.upsert_store(place_id, store_name, address, mapped, region)
+        if _biz_urls or _biz_count is not None:
+            master_db.upsert_business_images(store_id, place_id, _biz_urls, _biz_count)
     except Exception as e:
         return _error_resp("DB_ERROR", f"DB 저장 오류: {e}", start)
 
