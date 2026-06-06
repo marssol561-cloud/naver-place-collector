@@ -307,7 +307,7 @@ def upsert_business_images(store_id: str, place_id: str, image_urls: list, busin
     body = {
         "store_id": store_id,
         "place_id": place_id,
-        "image_urls": json.dumps(image_urls, ensure_ascii=False),
+        "image_urls": image_urls,
         "business_photo_count": business_photo_count,
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
