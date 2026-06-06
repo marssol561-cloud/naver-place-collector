@@ -522,6 +522,9 @@ def _extract_facilities_from_info_html(html: str) -> list:
     RC-2 (2026-06-06): numeric-ID filter (skips legacy string-keyed Apollo cache entries
     that partial/stale hydration can emit) + _fac_norm_key dedup (treats
     "무선인터넷"=="무선 인터넷"; prefers fee-tagged form, then longer form, then first seen).
+    RC-2 rev (2026-06-06): camelCase string IDs added to pattern — accessibility entries
+    (disabledFriendlyToilet, disabledFriendlyParking) use string IDs with all 4 fields
+    intact and are not stale. Stale entries are filtered downstream by name presence check.
 
     Structure: {"__typename":"InformationFacilities","id":"201","name":"콜키지 가능 (유료)","i18nName":"..."}
     No separate fee attribute — fee info is embedded in the name string.
@@ -529,7 +532,7 @@ def _extract_facilities_from_info_html(html: str) -> list:
     if not html:
         return []
     names_raw = []
-    for m in re.finditer(r'"InformationFacilities:(\d+)"\s*:\s*\{', html):
+    for m in re.finditer(r'"InformationFacilities:(\d+|[a-zA-Z][a-zA-Z0-9]*)"\s*:\s*\{', html):
         brace_start = m.end() - 1
         depth, end_pos = 0, brace_start
         for i in range(brace_start, min(brace_start + 1000, len(html))):
