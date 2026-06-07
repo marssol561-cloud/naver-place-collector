@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+import time
+
 import requests
 from dotenv import load_dotenv
 
@@ -178,6 +180,69 @@ def _auth_headers() -> dict:
     }
 
 
+# ── Industry normalization (SP-3) ────────────────────────────────────────────
+INDUSTRY_MAP_TTL_SECONDS = 86400  # 24 h
+
+_naver_map: dict = {}
+_naver_map_loaded_at: float = 0.0
+
+
+def _load_naver_map() -> dict:
+    """Fetch industry_naver_map from DB (TTL-cached 24 h). On failure: log warning, return empty dict."""
+    global _naver_map, _naver_map_loaded_at
+    now = time.monotonic()
+    if _naver_map_loaded_at > 0 and (now - _naver_map_loaded_at) < INDUSTRY_MAP_TTL_SECONDS:
+        return _naver_map
+    try:
+        resp = requests.get(
+            f"{MASTER_DB_URL}/rest/v1/industry_naver_map",
+            params={"select": "naver_category,industry"},
+            headers=_auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        _naver_map = {row["naver_category"]: row["industry"] for row in rows}
+        _naver_map_loaded_at = now
+        log.info("[industry_naver_map] loaded %d entries", len(_naver_map))
+    except Exception as exc:
+        log.warning("[industry_naver_map] fetch failed — raw values pass through: %s", exc)
+        _naver_map = {}
+        # _naver_map_loaded_at intentionally NOT updated so the next call retries
+    return _naver_map
+
+
+def normalize_industry(raw: str | None) -> tuple[str | None, bool]:
+    """Map raw Naver category to approved taxonomy via industry_naver_map.
+
+    Returns (mapped, True) on hit, (raw, False) on miss or empty map.
+    Empty/None raw → (raw, False) without lookup.
+    """
+    if not raw:
+        return (raw, False)
+    mapping = _load_naver_map()
+    if not mapping:
+        return (raw, False)
+    matched = mapping.get(raw)
+    if matched is not None:
+        return (matched, True)
+    return (raw, False)
+
+
+def _log_unclassified(raw: str, store_id: str | None) -> None:
+    """POST unmatched industry value to industry_unclassified_log. Never raises."""
+    try:
+        resp = requests.post(
+            f"{MASTER_DB_URL}/rest/v1/industry_unclassified_log",
+            json={"source": "crawler", "input_value": raw, "store_id": store_id},
+            headers=_auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        log.warning("[industry_unclassified_log] INSERT failed: %s", exc)
+
+
 def upsert_store(
     place_id: str | None,
     store_name: str,
@@ -207,9 +272,12 @@ def upsert_store(
             patch_body: dict = {"crawl_data": _safe_cd}
             if region:
                 patch_body["region"] = region
-            industry = _safe_cd.get("category")
-            if industry:
-                patch_body["industry"] = industry
+            _raw_cat = _safe_cd.get("category")
+            if _raw_cat:
+                _norm_cat, _cat_hit = normalize_industry(_raw_cat)
+                patch_body["industry"] = _norm_cat
+                if not _cat_hit:
+                    _log_unclassified(_raw_cat, store_id)
             patch = requests.patch(
                 f"{base}?place_id=eq.{place_id}",
                 json=patch_body,
@@ -247,9 +315,12 @@ def upsert_store(
                 }
                 if region:
                     upd["region"] = region
-                industry = _safe_cd2.get("category")
-                if industry:
-                    upd["industry"] = industry
+                _raw_cat = _safe_cd2.get("category")
+                if _raw_cat:
+                    _norm_cat, _cat_hit = normalize_industry(_raw_cat)
+                    upd["industry"] = _norm_cat
+                    if not _cat_hit:
+                        _log_unclassified(_raw_cat, existing_id)
                 patch = requests.patch(
                     f"{base}?store_id=eq.{existing_id}",
                     json=upd,
@@ -270,9 +341,12 @@ def upsert_store(
             }
             if region:
                 body["region"] = region
-            industry = crawl_data.get("category")
-            if industry:
-                body["industry"] = industry
+            _raw_cat = crawl_data.get("category")
+            if _raw_cat:
+                _norm_cat, _cat_hit = normalize_industry(_raw_cat)
+                body["industry"] = _norm_cat
+                if not _cat_hit:
+                    _log_unclassified(_raw_cat, None)  # store_id not yet assigned
             ins = requests.post(base, json=body, headers=headers, timeout=10)
             ins.raise_for_status()
             store_id = ins.json()[0]["store_id"]
