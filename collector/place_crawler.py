@@ -39,6 +39,8 @@ PLACE_FIELDS = [
     "photo_count",
     "visitor_review_count",
     "blog_review_count",
+    "naedon_blog_review_count",
+    "naedon_blog_latest_date",
     "reservation_active",
     "naver_pay_active",
     "coupon_active",
@@ -1134,6 +1136,79 @@ def _extract_category_from_apollo(html: str) -> str:
     return ""
 
 
+def _parse_naedon_response(body) -> tuple:
+    """getFsasReviews (buyWithMyMoneyType:true) GQL 응답 파싱.
+    Returns (count: str, latest_date: str "YYYY-MM-DD"). 데이터 없으면 ("0", "").
+    """
+    root = body[0] if isinstance(body, list) else body
+    fsas = (root.get("data") or {}).get("fsasReviews") or {}
+    total = fsas.get("total", 0)
+    items = fsas.get("items") or []
+    if not total or not items:
+        return "0", ""
+    dates = [
+        it["date"].rstrip(".").replace(".", "-")
+        for it in items if it.get("date")
+    ]
+    return str(total), (max(dates) if dates else "")
+
+
+async def _collect_naedon_blog_fields(
+    page,
+    entry_frame,
+    place_id: str,
+    ptype: str = "restaurant",
+    timeout_ms: int = 15_000,
+) -> tuple:
+    """home 탭 이동 후 '블로그 리뷰 N' 링크 클릭 → getFsasReviews (buyWithMyMoneyType:true) 캡처.
+    Returns (count: str, latest_date: str "YYYY-MM-DD"). 실패 시 ("", "").
+    """
+    matched: dict = {}
+    got_event = asyncio.Event()
+
+    async def _handler(response):
+        if got_event.is_set():
+            return
+        if "graphql" not in response.url or "naver.com" not in response.url:
+            return
+        try:
+            pd = response.request.post_data or ""
+        except Exception:
+            return
+        if ('"operationName":"getFsasReviews"' not in pd
+                or '"buyWithMyMoneyType":true' not in pd):
+            return
+        try:
+            body = await response.json()
+            matched["body"] = body
+            got_event.set()
+        except Exception:
+            pass
+
+    page.on("response", _handler)
+    try:
+        home_url = f"https://pcmap.place.naver.com/{ptype}/{place_id}/home"
+        await entry_frame.goto(home_url, wait_until="networkidle", timeout=timeout_ms)
+        await page.wait_for_timeout(1500)
+        blog_link = entry_frame.locator('a:has-text("블로그 리뷰")')
+        if await blog_link.count() == 0:
+            return "", ""
+        await blog_link.first.click()
+        try:
+            await asyncio.wait_for(got_event.wait(), timeout=12.0)
+        except asyncio.TimeoutError:
+            return "", ""
+        body = matched.get("body")
+        if not body:
+            return "", ""
+        return _parse_naedon_response(body)
+    except Exception as _e:
+        print(f"[naedon] 수집 실패 ({type(_e).__name__}): {str(_e)[:80]}")
+        return "", ""
+    finally:
+        page.remove_listener("response", _handler)
+
+
 # ── 메인 수집 함수 ────────────────────────────────────────────────────────────
 
 async def crawl_place_by_id(place_id: str) -> dict | None:
@@ -1477,6 +1552,13 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                                     _merged.append(_lbl)
                                     _seen_nk.add(_nk)
                             result["facilities"] = json.dumps(_merged, ensure_ascii=False)
+
+                    # naedon blog fields — getFsasReviews buyWithMyMoneyType capture
+                    _naedon_count, _naedon_date = await _collect_naedon_blog_fields(
+                        page, entry_frame, place_id, _ptype
+                    )
+                    result["naedon_blog_review_count"] = _naedon_count
+                    result["naedon_blog_latest_date"] = _naedon_date
                 except Exception as _e:
                     print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
 
