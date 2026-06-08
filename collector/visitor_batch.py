@@ -3,8 +3,10 @@ from collector.visitor_review_aggregate import aggregate_visitor_reviews
 
 
 def collect_visitor_reviews(place_id):
-    """Headed live collection. Deferred to Impl-3."""
-    raise NotImplementedError("headed live visitor collection is implemented in Impl-3")
+    """Headed live collection of visitor reviews for place_id (sync wrapper)."""
+    import asyncio
+    from collector.visitor_collect import collect_visitor_items
+    return asyncio.run(collect_visitor_items(place_id))
 
 
 def run_batch(place_id, collector=None):

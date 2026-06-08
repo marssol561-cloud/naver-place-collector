@@ -1,8 +1,6 @@
 import json
 from pathlib import Path
 
-import pytest
-
 from collector.visitor_batch import collect_visitor_reviews, run_batch
 
 FIXTURE = Path(__file__).resolve().parents[1] / "reviews_expand_visitor_1709413013.json"
@@ -26,8 +24,3 @@ def test_run_batch_pipeline():
 
 def test_result_json_serializable():
     json.dumps(run_batch("1709413013", collector=fake_collector))
-
-
-def test_live_collector_is_stub():
-    with pytest.raises(NotImplementedError):
-        collect_visitor_reviews("x")
