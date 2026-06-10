@@ -24,3 +24,37 @@ def test_run_batch_pipeline():
 
 def test_result_json_serializable():
     json.dumps(run_batch("1709413013", collector=fake_collector))
+
+
+def test_run_batch_cache_hit(monkeypatch):
+    import db.master_db
+    import db.visitor_db
+    import collector.visitor_batch as vb
+
+    CACHED = {"total_count": 999, "first_review_date": "2022-01-01"}
+
+    monkeypatch.setattr(db.master_db, "find_store_by_place_id", lambda pid: {"store_id": "S1"})
+    monkeypatch.setattr(db.visitor_db, "check_visitor_reviews_complete", lambda sid: True)
+    monkeypatch.setattr(db.visitor_db, "get_visitor_reviews", lambda sid: CACHED)
+
+    collector_called = []
+
+    def _sentinel(place_id):
+        collector_called.append(place_id)
+        return []
+
+    monkeypatch.setattr(vb, "collect_visitor_reviews", _sentinel)
+
+    result = run_batch("1709413013")
+    assert result == CACHED
+    assert collector_called == []
+
+
+def test_run_batch_cache_miss_falls_through():
+    result = run_batch("1709413013", collector=fake_collector)
+    assert result["total_count"] == 1073
+
+
+def test_run_batch_use_cache_false():
+    result = run_batch("1709413013", collector=fake_collector, use_cache=False)
+    assert result["total_count"] == 1073
