@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import COLLECTOR_API_KEY
 from db import master_db
 from collector import searcher, place_crawler
+from collector import visitor_batch
 
 app = FastAPI(title="Naver Place Collector API")
 
@@ -143,6 +144,28 @@ async def get_store(
         business_images = None
 
     return JSONResponse(content={"status": "ok", "store": store, "business_images": business_images})
+
+
+@app.get("/api/v1/stores/{store_id}/visitor-reviews", dependencies=[Depends(verify_api_key)])
+async def get_visitor_reviews(store_id: str):
+    store = master_db.find_store_by_id(store_id)
+    if store is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "error_code": "STORE_NOT_FOUND", "message": f"store_id={store_id} 없음"},
+        )
+    place_id = store.get("place_id")
+    if not place_id:
+        return JSONResponse(
+            content={"status": "error", "error_code": "PLACE_ID_MISSING", "message": "store has no place_id"},
+        )
+    try:
+        agg = visitor_batch.run_batch(place_id)
+    except Exception as e:
+        return JSONResponse(
+            content={"status": "error", "error_code": "AGGREGATE_FAILED", "message": str(e)},
+        )
+    return JSONResponse(content={"status": "ok", "store_id": store_id, "place_id": place_id, "visitor_reviews": agg})
 
 
 @app.post("/api/v1/collect", dependencies=[Depends(verify_api_key)])
