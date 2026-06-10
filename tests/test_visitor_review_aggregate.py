@@ -47,6 +47,19 @@ def test_daily_counts_sum(result):
     assert sum(result["daily_counts"].values()) == 1073
 
 
+def test_daily_average_reviews(result):
+    assert round(result["daily_average_reviews"], 2) == 2.73
+
+
+def test_revisit_distribution(result):
+    assert result["revisit_distribution"] == {1: 1048, 2: 18, 3: 3, 4: 1, 5: 1, 6: 1, 7: 1}
+
+
+def test_owner_receipt_reply_rate(result):
+    assert result["reply_count"] == 0
+    assert result["owner_receipt_reply_rate"] == 0.0
+
+
 def test_empty_list_edge():
     r = aggregate_visitor_reviews([])
     assert r["total_count"] == 0
@@ -55,3 +68,7 @@ def test_empty_list_edge():
     assert r["daily_counts"] == {}
     assert r["revisit_ratio"] == 0.0
     assert r["receipt_ratio"] == 0.0
+    assert r["daily_average_reviews"] == 0.0
+    assert r["revisit_distribution"] == {}
+    assert r["reply_count"] == 0
+    assert r["owner_receipt_reply_rate"] == 0.0

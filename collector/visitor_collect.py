@@ -470,6 +470,7 @@ async def collect_visitor_items(place_id):
             "originType":                  it.get("originType"),
             "author":                      (it.get("author") or {}).get("nickname"),
             "id":                          it.get("id"),
+            "has_owner_reply":             bool((it.get("reply") or {}).get("body")),
         }
         for it in visitor_items
     ]
