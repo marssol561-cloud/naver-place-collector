@@ -65,8 +65,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Visitor review batch aggregator")
     parser.add_argument("--place-id", required=True)
     parser.add_argument("--out", default=None, help="output JSON path; stdout if omitted")
+    parser.add_argument("--no-cache", action="store_true", help="bypass cache, always crawl live")
     args = parser.parse_args(argv)
-    agg = run_batch(args.place_id)
+    agg = run_batch(args.place_id, use_cache=not args.no_cache)
     text = json.dumps(agg, ensure_ascii=False, indent=2)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
