@@ -1,10 +1,14 @@
 import json
-from pathlib import Path
 
 from collector.visitor_batch import collect_visitor_reviews, run_batch
 
-FIXTURE = Path(__file__).resolve().parents[1] / "reviews_expand_visitor_1709413013.json"
-_items = json.load(open(FIXTURE, encoding="utf-8"))["items"]
+_items = [
+    {"representativeVisitDateTime": "2023-01-01T12:00:00", "visitCount": 1, "originType": "영수증", "has_owner_reply": True},
+    {"representativeVisitDateTime": "2023-01-01T18:00:00", "visitCount": 2, "originType": "영수증", "has_owner_reply": False},
+    {"representativeVisitDateTime": "2023-01-02T12:00:00", "visitCount": 3, "originType": "영수증", "has_owner_reply": True},
+    {"representativeVisitDateTime": "2023-01-03T12:00:00", "visitCount": 1, "originType": "블로그", "has_owner_reply": False},
+    {"representativeVisitDateTime": "2023-01-03T20:00:00", "visitCount": 2, "originType": "영수증", "has_owner_reply": True},
+]
 
 
 def fake_collector(place_id):
@@ -13,13 +17,13 @@ def fake_collector(place_id):
 
 def test_run_batch_pipeline():
     agg = run_batch("1709413013", collector=fake_collector)
-    assert agg["total_count"] == 1073
-    assert agg["first_review_date"] == "2022-04-02"
-    assert agg["distinct_review_days"] == 393
-    assert agg["revisit_count"] == 25
-    assert round(agg["revisit_ratio"] * 100, 1) == 2.3
-    assert agg["receipt_count"] == 1061
-    assert round(agg["receipt_ratio"] * 100, 1) == 98.9
+    assert agg["total_count"] == 5
+    assert agg["first_review_date"] == "2023-01-01"
+    assert agg["distinct_review_days"] == 3
+    assert agg["revisit_count"] == 3
+    assert round(agg["revisit_ratio"] * 100, 1) == 60.0
+    assert agg["receipt_count"] == 4
+    assert round(agg["receipt_ratio"] * 100, 1) == 80.0
 
 
 def test_result_json_serializable():
@@ -54,12 +58,12 @@ def test_run_batch_cache_hit(monkeypatch):
 
 def test_run_batch_cache_miss_falls_through():
     result = run_batch("1709413013", collector=fake_collector)
-    assert result["total_count"] == 1073
+    assert result["total_count"] == 5
 
 
 def test_run_batch_use_cache_false():
     result = run_batch("1709413013", collector=fake_collector, use_cache=False)
-    assert result["total_count"] == 1073
+    assert result["total_count"] == 5
 
 
 def test_refresh_peek_gt_stored_triggers_recrawl(monkeypatch):
