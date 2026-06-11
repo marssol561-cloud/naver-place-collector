@@ -1,63 +1,60 @@
-"""Offline unit tests for aggregate_visitor_reviews using the 1073-record fixture."""
-
-import json
-from pathlib import Path
+"""Offline unit tests for aggregate_visitor_reviews using the inline fixture."""
 
 import pytest
 
 from collector.visitor_review_aggregate import aggregate_visitor_reviews
 
-FIXTURE = Path(__file__).resolve().parents[1] / "reviews_expand_visitor_1709413013.json"
-
-
-def _load_items():
-    with open(FIXTURE, encoding="utf-8") as f:
-        data = json.load(f)
-    return data["items"]
+_ITEMS = [
+    {"representativeVisitDateTime": "2023-01-01T12:00:00", "visitCount": 1, "originType": "영수증", "has_owner_reply": True},
+    {"representativeVisitDateTime": "2023-01-01T18:00:00", "visitCount": 2, "originType": "영수증", "has_owner_reply": False},
+    {"representativeVisitDateTime": "2023-01-02T12:00:00", "visitCount": 3, "originType": "영수증", "has_owner_reply": True},
+    {"representativeVisitDateTime": "2023-01-03T12:00:00", "visitCount": 1, "originType": "블로그", "has_owner_reply": False},
+    {"representativeVisitDateTime": "2023-01-03T20:00:00", "visitCount": 2, "originType": "영수증", "has_owner_reply": True},
+]
 
 
 @pytest.fixture(scope="module")
 def result():
-    return aggregate_visitor_reviews(_load_items())
+    return aggregate_visitor_reviews(_ITEMS)
 
 
 def test_total_count(result):
-    assert result["total_count"] == 1073
+    assert result["total_count"] == 5
 
 
 def test_first_review_date(result):
-    assert result["first_review_date"] == "2022-04-02"
+    assert result["first_review_date"] == "2023-01-01"
 
 
 def test_distinct_review_days(result):
-    assert result["distinct_review_days"] == 393
+    assert result["distinct_review_days"] == 3
 
 
 def test_revisit(result):
-    assert result["revisit_count"] == 25
-    assert round(result["revisit_ratio"] * 100, 1) == 2.3
+    assert result["revisit_count"] == 3
+    assert round(result["revisit_ratio"] * 100, 1) == 60.0
 
 
 def test_receipt(result):
-    assert result["receipt_count"] == 1061
-    assert round(result["receipt_ratio"] * 100, 1) == 98.9
+    assert result["receipt_count"] == 4
+    assert round(result["receipt_ratio"] * 100, 1) == 80.0
 
 
 def test_daily_counts_sum(result):
-    assert sum(result["daily_counts"].values()) == 1073
+    assert sum(result["daily_counts"].values()) == 5
 
 
 def test_daily_average_reviews(result):
-    assert round(result["daily_average_reviews"], 2) == 2.73
+    assert round(result["daily_average_reviews"], 2) == 1.67
 
 
 def test_revisit_distribution(result):
-    assert result["revisit_distribution"] == {1: 1048, 2: 18, 3: 3, 4: 1, 5: 1, 6: 1, 7: 1}
+    assert result["revisit_distribution"] == {1: 2, 2: 2, 3: 1}
 
 
 def test_owner_receipt_reply_rate(result):
-    assert result["reply_count"] == 0
-    assert result["owner_receipt_reply_rate"] == 0.0
+    assert result["reply_count"] == 3
+    assert result["owner_receipt_reply_rate"] == 0.75
 
 
 def test_empty_list_edge():
