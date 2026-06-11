@@ -1,6 +1,8 @@
 import json
+from datetime import date
 
 from collector.visitor_batch import collect_visitor_reviews, run_batch
+from collector.visitor_review_aggregate import aggregate_visitor_reviews, compute_daily_average_reviews
 
 _items = [
     {"representativeVisitDateTime": "2023-01-01T12:00:00", "visitCount": 1, "originType": "영수증", "has_owner_reply": True},
@@ -226,6 +228,59 @@ def test_refresh_peek_raises_returns_cache(monkeypatch):
     result = run_batch("1709413013")
     assert result == CACHED
     assert collector_called == []
+
+
+def test_compute_daily_average_lifecycle():
+    """어반정원 실제 수치: 1076건, 2022-04-02~2026-06-12.
+    span = (2026-06-12 - 2022-04-02).days + 1 = 1533 (inclusive both ends).
+    1076/1533 ≈ 0.7019."""
+    result = compute_daily_average_reviews(1076, "2022-04-02", as_of_date=date(2026, 6, 12))
+    assert abs(result - (1076 / 1533)) < 1e-9
+
+
+def test_aggregate_uses_lifecycle_denominator():
+    """aggregate는 lifecycle_days를 사용해야 하며, distinct_review_days와 달라야 한다."""
+    items = [
+        {"representativeVisitDateTime": "2023-01-01T12:00:00", "visitCount": 1,
+         "originType": "영수증", "has_owner_reply": False},
+        {"representativeVisitDateTime": "2023-01-03T12:00:00", "visitCount": 1,
+         "originType": "영수증", "has_owner_reply": False},
+    ]
+    # distinct_review_days = 2, lifecycle_days (2023-01-01 → 2023-01-10) = 10
+    r = aggregate_visitor_reviews(items, as_of_date=date(2023, 1, 10))
+    assert r["distinct_review_days"] == 2
+    assert abs(r["daily_average_reviews"] - (2 / 10)) < 1e-9
+
+
+def test_cached_return_recomputes_daily_average(monkeypatch):
+    """캐시된 stale daily_average_reviews가 lifecycle 값으로 재계산되어 반환되어야 한다."""
+    import db.master_db
+    import db.visitor_db
+    import collector.visitor_batch as vb
+    import collector.visitor_collect as vc
+
+    CACHED = {
+        "total_count": 1076,
+        "first_review_date": "2022-04-02",
+        "source_total_count": 1076,
+        "daily_average_reviews": 2.72,  # stale active-days value
+    }
+
+    monkeypatch.setattr(db.master_db, "find_store_by_place_id", lambda pid: {"store_id": "S1"})
+    monkeypatch.setattr(db.visitor_db, "check_visitor_reviews_complete", lambda sid: True)
+    monkeypatch.setattr(db.visitor_db, "get_visitor_reviews", lambda sid: CACHED)
+    monkeypatch.setattr(vc, "peek_total_count", lambda pid: None)
+
+    result = run_batch("1709413013")
+    assert result["daily_average_reviews"] != 2.72
+    # lifecycle value must be < 1.0 (1076 / many lifecycle days)
+    assert result["daily_average_reviews"] < 1.0
+
+
+def test_compute_daily_average_guards():
+    """first_review_date=None → 0.0; as_of earlier than first → 0.0."""
+    assert compute_daily_average_reviews(100, None, as_of_date=date(2026, 1, 1)) == 0.0
+    assert compute_daily_average_reviews(100, "2026-06-01", as_of_date=date(2026, 1, 1)) == 0.0
 
 
 def test_no_cache_full_crawl_live_path(monkeypatch):

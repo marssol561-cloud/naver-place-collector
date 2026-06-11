@@ -1,8 +1,9 @@
 """Offline unit tests for aggregate_visitor_reviews using the inline fixture."""
 
 import pytest
+from datetime import date
 
-from collector.visitor_review_aggregate import aggregate_visitor_reviews
+from collector.visitor_review_aggregate import aggregate_visitor_reviews, compute_daily_average_reviews
 
 _ITEMS = [
     {"representativeVisitDateTime": "2023-01-01T12:00:00", "visitCount": 1, "originType": "영수증", "has_owner_reply": True},
@@ -13,9 +14,12 @@ _ITEMS = [
 ]
 
 
+_AS_OF = date(2023, 1, 3)  # lifecycle_days = (2023-01-03 - 2023-01-01).days+1 = 3
+
+
 @pytest.fixture(scope="module")
 def result():
-    return aggregate_visitor_reviews(_ITEMS)
+    return aggregate_visitor_reviews(_ITEMS, as_of_date=_AS_OF)
 
 
 def test_total_count(result):
@@ -45,6 +49,7 @@ def test_daily_counts_sum(result):
 
 
 def test_daily_average_reviews(result):
+    # lifecycle_days = 3 (2023-01-01 → 2023-01-03), total=5 → 5/3 ≈ 1.67
     assert round(result["daily_average_reviews"], 2) == 1.67
 
 

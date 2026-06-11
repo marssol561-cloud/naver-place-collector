@@ -1,5 +1,5 @@
 import argparse, json, sys
-from collector.visitor_review_aggregate import aggregate_visitor_reviews
+from collector.visitor_review_aggregate import aggregate_visitor_reviews, compute_daily_average_reviews
 
 
 def collect_visitor_reviews(place_id):
@@ -22,6 +22,8 @@ def run_batch(place_id, collector=None, use_cache=True):
             if store and check_visitor_reviews_complete(store["store_id"]):
                 cached = get_visitor_reviews(store["store_id"])
                 if cached is not None:
+                    cached["daily_average_reviews"] = compute_daily_average_reviews(
+                        cached.get("total_count") or 0, cached.get("first_review_date"))
                     try:
                         from collector.visitor_collect import peek_total_count
                         peek = peek_total_count(place_id)

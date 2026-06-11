@@ -1,7 +1,32 @@
 """Pure aggregation function for getVisitorReviews item dicts."""
 
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
-def aggregate_visitor_reviews(items):
+
+def _lifecycle_days(first_review_date, as_of_date):
+    """Calendar days from first_review_date to as_of_date, inclusive."""
+    if not first_review_date:
+        return None
+    try:
+        first = date.fromisoformat(str(first_review_date)[:10])
+    except Exception:
+        return None
+    span = (as_of_date - first).days + 1
+    return span if span >= 1 else None
+
+
+def compute_daily_average_reviews(total_count, first_review_date, as_of_date=None):
+    """Reviews per calendar day across lifecycle (first_review_date → as_of_date)."""
+    if as_of_date is None:
+        as_of_date = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    days = _lifecycle_days(first_review_date, as_of_date)
+    if not days:
+        return 0.0
+    return total_count / days
+
+
+def aggregate_visitor_reviews(items, as_of_date=None):
     """items: list[dict], each a getVisitorReviews item. Returns dict (keys below)."""
     total_count = len(items)
 
@@ -25,7 +50,7 @@ def aggregate_visitor_reviews(items):
     )
     receipt_ratio = receipt_count / total_count if total_count else 0.0
 
-    daily_average_reviews = total_count / distinct_review_days if distinct_review_days > 0 else 0.0
+    daily_average_reviews = compute_daily_average_reviews(total_count, first_review_date, as_of_date)
 
     revisit_distribution = {}
     for it in items:
