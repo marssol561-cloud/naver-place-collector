@@ -12,7 +12,7 @@ def collect_visitor_reviews(place_id):
 def run_batch(place_id, collector=None, use_cache=True):
     """Collect visitor review items for place_id, then aggregate.
     If use_cache=True and no custom collector, checks satellite table first
-    and saves results after crawling."""
+    and saves results after crawling. Refreshes when platform total increases."""
     # Dedup check — only when using live collector and cache enabled
     if use_cache and collector is None:
         try:
@@ -22,13 +22,31 @@ def run_batch(place_id, collector=None, use_cache=True):
             if store and check_visitor_reviews_complete(store["store_id"]):
                 cached = get_visitor_reviews(store["store_id"])
                 if cached is not None:
-                    return cached
+                    try:
+                        from collector.visitor_collect import peek_total_count
+                        peek = peek_total_count(place_id)
+                        stored_total = cached.get("source_total_count")
+                        if peek is not None and stored_total is not None and peek > stored_total:
+                            pass  # fall through to re-crawl
+                        else:
+                            return cached
+                    except Exception:
+                        return cached  # non-fatal: peek error → use cache
         except Exception:
             pass  # fall through to crawl
 
     collect = collector or collect_visitor_reviews
-    items = collect(place_id)
+    raw = collect(place_id)
+
+    if isinstance(raw, dict):
+        items = raw.get("items") or []
+        source_total = raw.get("source_total_count")
+    else:
+        items = raw
+        source_total = None
+
     agg = aggregate_visitor_reviews(items)
+    agg["source_total_count"] = source_total
 
     # Save to satellite table — only when using live collector and cache enabled
     if use_cache and collector is None:

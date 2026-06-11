@@ -19,6 +19,7 @@ REQUIRED_FIELDS = [
     "reply_count",
     "owner_receipt_reply_rate",
     "daily_counts",
+    "source_total_count",
 ]
 
 
@@ -48,6 +49,7 @@ def upsert_visitor_reviews(place_id: str, agg: dict) -> str | None:
         "reply_count": agg.get("reply_count"),
         "owner_receipt_reply_rate": agg.get("owner_receipt_reply_rate"),
         "daily_counts": agg.get("daily_counts"),
+        "source_total_count": agg.get("source_total_count"),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
     resp = requests.post(
@@ -67,7 +69,7 @@ def get_visitor_reviews(store_id: str) -> dict | None:
                 "place_id,total_count,receipt_count,first_review_date,"
                 "distinct_review_days,daily_average_reviews,revisit_count,"
                 "revisit_ratio,revisit_distribution,reply_count,"
-                "owner_receipt_reply_rate,daily_counts,captured_at"
+                "owner_receipt_reply_rate,daily_counts,source_total_count,captured_at"
             ),
             "store_id": f"eq.{store_id}",
         },

@@ -22,6 +22,7 @@ FULL_AGG = {
     "reply_count": 0,
     "owner_receipt_reply_rate": 0.0,
     "daily_counts": {"2022-04-02": 1},
+    "source_total_count": 1159,
 }
 
 FULL_ROW = {
@@ -37,6 +38,7 @@ FULL_ROW = {
     "reply_count": 0,
     "owner_receipt_reply_rate": 0.0,
     "daily_counts": {"2022-04-02": 1},
+    "source_total_count": 1159,
     "captured_at": "2026-06-10T00:00:00+00:00",
 }
 
@@ -75,6 +77,7 @@ def test_upsert_writes_all_fields(mocked):
         "total_count", "receipt_count", "first_review_date", "distinct_review_days",
         "daily_average_reviews", "revisit_count", "revisit_ratio",
         "revisit_distribution", "reply_count", "owner_receipt_reply_rate", "daily_counts",
+        "source_total_count",
     ]:
         assert key in body, f"missing column in POST body: {key}"
 

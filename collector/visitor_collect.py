@@ -404,8 +404,7 @@ async def process_tab(page, tab_name, all_captures, log_fn, place_id):
 
 async def collect_visitor_items(place_id):
     """Headed Playwright collection of visitor reviews for place_id.
-    Returns list[dict] flattened items: {created, representativeVisitDateTime,
-    visitCount, originType, author, id}."""
+    Returns dict {"items": list[dict], "source_total_count": int|None}."""
 
     logs = []
 
@@ -462,15 +461,122 @@ async def collect_visitor_items(place_id):
         finally:
             await browser.close()
 
-    return [
-        {
-            "created":                     it.get("created"),
-            "representativeVisitDateTime": it.get("representativeVisitDateTime"),
-            "visitCount":                  it.get("visitCount"),
-            "originType":                  it.get("originType"),
-            "author":                      (it.get("author") or {}).get("nickname"),
-            "id":                          it.get("id"),
-            "has_owner_reply":             bool((it.get("reply") or {}).get("body")),
-        }
-        for it in visitor_items
-    ]
+    source_total = None
+    try:
+        raw_total = _meta.get("api_total")
+        if raw_total is not None:
+            source_total = int(raw_total)
+    except (TypeError, ValueError):
+        pass
+
+    return {
+        "items": [
+            {
+                "created":                     it.get("created"),
+                "representativeVisitDateTime": it.get("representativeVisitDateTime"),
+                "visitCount":                  it.get("visitCount"),
+                "originType":                  it.get("originType"),
+                "author":                      (it.get("author") or {}).get("nickname"),
+                "id":                          it.get("id"),
+                "has_owner_reply":             bool((it.get("reply") or {}).get("body")),
+            }
+            for it in visitor_items
+        ],
+        "source_total_count": source_total,
+    }
+
+
+# ─────────────────────────── peek helper ───────────────────────────
+
+async def _peek_total_count_async(place_id) -> int | None:
+    """Light-fetch: navigate visitor tab, capture first getVisitorReviews GQL
+    response, return visitorReviews.total. No expand-click or scroll loop."""
+    HOME_URL = f"https://pcmap.place.naver.com/restaurant/{place_id}/home"
+    fallback_url = f"https://pcmap.place.naver.com/restaurant/{place_id}/review/visitor"
+
+    all_captures = []
+
+    async def on_resp(response):
+        req = response.request
+        if req.resource_type not in ("xhr", "fetch"):
+            return
+        try:
+            raw = await response.body()
+            text = raw.decode("utf-8", errors="replace")
+        except Exception:
+            return
+        try:
+            bj = json.loads(text)
+        except Exception:
+            bj = None
+        all_captures.append({
+            "url":       response.url,
+            "post_data": req.post_data,
+            "body_json": bj,
+            "is_gql":    "graphql" in response.url.lower(),
+        })
+
+    launch_opts = {
+        "headless": False,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--start-maximized",
+        ],
+    }
+    if PROXY_URL:
+        launch_opts["proxy"] = {"server": PROXY_URL}
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(**launch_opts)
+        try:
+            ctx = await browser.new_context(
+                user_agent=_UA,
+                viewport={"width": 1280, "height": 900},
+            )
+            ctx.on("response", on_resp)
+            page = await ctx.new_page()
+
+            try:
+                await page.goto(HOME_URL, wait_until="networkidle", timeout=35_000)
+            except PlaywrightTimeoutError:
+                await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=25_000)
+            await page.wait_for_timeout(3_000)
+
+            anchor_sel = "a[href*='/review/visitor']"
+            try:
+                link = page.locator(anchor_sel).first
+                await link.wait_for(state="visible", timeout=8_000)
+                await link.click()
+                await page.wait_for_timeout(5_000)
+            except Exception:
+                try:
+                    await page.goto(fallback_url, wait_until="networkidle", timeout=30_000)
+                except PlaywrightTimeoutError:
+                    await page.goto(fallback_url, wait_until="domcontentloaded", timeout=20_000)
+                await page.wait_for_timeout(5_000)
+
+            await wait_new_gql(
+                all_captures, 0, "getVisitorReviews", "visitorReviews", timeout_s=10.0
+            )
+
+            total = None
+            batches = extract_batches(all_captures, 0, "getVisitorReviews", "visitorReviews")
+            if batches:
+                raw_total = batches[0].get("total")
+                if raw_total is not None:
+                    total = int(raw_total)
+
+            await page.close()
+        finally:
+            await browser.close()
+
+    return total
+
+
+def peek_total_count(place_id) -> int | None:
+    """Return platform visitor-review total from the first GQL response without
+    triggering 펼쳐서 더보기 or any scroll loop. Returns None on any failure."""
+    try:
+        return asyncio.run(_peek_total_count_async(place_id))
+    except Exception:
+        return None
