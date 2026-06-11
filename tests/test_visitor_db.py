@@ -129,3 +129,24 @@ def test_check_complete_missing_field(monkeypatch):
 def test_check_complete_no_row(monkeypatch):
     monkeypatch.setattr(db.visitor_db, "get_visitor_reviews", lambda sid: None)
     assert check_visitor_reviews_complete(FAKE_STORE_ID) is False
+
+
+def test_check_complete_source_total_count_none(monkeypatch):
+    """source_total_count removed from REQUIRED_FIELDS: row complete even when None."""
+    row = {
+        "place_id": KNOWN_PLACE_ID,
+        "total_count": 1073,
+        "first_review_date": "2022-04-02",
+        "distinct_review_days": 393,
+        "daily_average_reviews": 2.73,
+        "revisit_count": 25,
+        "revisit_ratio": 0.023,
+        "revisit_distribution": {1: 1048},
+        "reply_count": 0,
+        "owner_receipt_reply_rate": 0.0,
+        "daily_counts": {"2022-04-02": 1},
+        "source_total_count": None,
+        "captured_at": "2026-06-10T00:00:00+00:00",
+    }
+    monkeypatch.setattr(db.visitor_db, "get_visitor_reviews", lambda sid: row)
+    assert check_visitor_reviews_complete(FAKE_STORE_ID) is True

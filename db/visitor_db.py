@@ -19,7 +19,6 @@ REQUIRED_FIELDS = [
     "reply_count",
     "owner_receipt_reply_rate",
     "daily_counts",
-    "source_total_count",
 ]
 
 
