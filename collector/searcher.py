@@ -22,6 +22,9 @@ _ITEMS_RE = re.compile(
 )
 _NUMERIC_RE = re.compile(r"^\d+$")
 _ADDR_NUMBER_SUFFIX_RE = re.compile(r"\s+\d[\d\-]*\s*$")
+# Matches /entry/place/{id}, /place/{id}, /restaurant/{id} in the final page URL
+# when Naver redirects directly to a place detail page (no searchIframe available)
+_DIRECT_URL_RE = re.compile(r"/(?:entry/place|restaurant|place)/(\d{6,})")
 
 
 async def search_place_id(store_name: str, address: str) -> str | None:
@@ -73,6 +76,19 @@ async def _search_single_query(query: str, store_name: str) -> str | None:
                 except PlaywrightTimeoutError:
                     print(f"[오류] 페이지 로드 타임아웃: {store_name!r}")
                     return None
+
+                # Wait for any redirect to settle before reading the final URL
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except PlaywrightTimeoutError:
+                    pass  # proceed even if not fully idle
+
+                # FIX: detect direct-entry redirect (no searchIframe on detail pages)
+                # Naver sometimes redirects search to /place/{id}, /entry/place/{id}, etc.
+                m_direct = _DIRECT_URL_RE.search(page.url)
+                if m_direct and _NUMERIC_RE.match(m_direct.group(1)):
+                    print(f"[검색] direct-entry 리디렉트 감지, place_id={m_direct.group(1)}: {store_name!r}")
+                    return m_direct.group(1)
 
                 try:
                     await page.wait_for_selector("iframe#searchIframe", timeout=12_000)
