@@ -1,3 +1,4 @@
+import json as _json
 import requests
 from datetime import datetime, timezone
 
@@ -7,6 +8,7 @@ from db.master_db import (
     MASTER_DB_SERVICE_ROLE_KEY,
     _auth_headers,
 )
+from collector.visitor_review_aggregate import compute_daily_average_reviews
 
 REQUIRED_FIELDS = [
     "total_count",
@@ -22,12 +24,100 @@ REQUIRED_FIELDS = [
 ]
 
 
+def _parse_dict_field(v):
+    """dict or JSON-string → dict; returns {} on None/invalid."""
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return v
+    try:
+        return _json.loads(v)
+    except Exception:
+        return {}
+
+
+def _merge_aggregates(stored: dict, new: dict) -> dict:
+    """Merge new aggregate into stored so stored history never shrinks."""
+    # daily_counts: union; per-date value = max(stored, new)
+    stored_dc = _parse_dict_field(stored.get("daily_counts"))
+    new_dc = _parse_dict_field(new.get("daily_counts"))
+    merged_dc = dict(stored_dc)
+    for d, cnt in new_dc.items():
+        merged_dc[d] = max(merged_dc.get(d, 0), cnt)
+
+    # first_review_date: earliest key in merged daily_counts
+    first = min(merged_dc.keys()) if merged_dc else None
+    if first is None:
+        candidates = [x for x in [stored.get("first_review_date"), new.get("first_review_date")] if x]
+        first = min(candidates) if candidates else None
+
+    distinct = len(merged_dc)
+
+    # total_count: max(stored, new, sum_of_daily)
+    total = max(
+        stored.get("total_count") or 0,
+        new.get("total_count") or 0,
+        sum(merged_dc.values()),
+    )
+
+    # revisit_distribution: union; per-bucket = max(stored, new)
+    stored_rd = _parse_dict_field(stored.get("revisit_distribution"))
+    new_rd = _parse_dict_field(new.get("revisit_distribution"))
+    merged_rd = {int(k): v for k, v in stored_rd.items()}
+    for k, v in new_rd.items():
+        ik = int(k)
+        merged_rd[ik] = max(merged_rd.get(ik, 0), v)
+
+    revisit_count = sum(v for k, v in merged_rd.items() if k >= 2)
+    revisit_ratio = revisit_count / total if total else 0.0
+
+    receipt_count = max(stored.get("receipt_count") or 0, new.get("receipt_count") or 0)
+    reply_count = max(stored.get("reply_count") or 0, new.get("reply_count") or 0)
+
+    stored_rc = stored.get("receipt_count") or 0
+    new_rc = new.get("receipt_count") or 0
+    # owner_receipt_reply_rate: from the side with larger receipt_count
+    # NOTE: approximate under aggregate-only merge; precise recompute deferred to S2b
+    owner_receipt_reply_rate = (
+        new.get("owner_receipt_reply_rate") or 0.0
+        if new_rc >= stored_rc
+        else stored.get("owner_receipt_reply_rate") or 0.0
+    )
+
+    daily_average = compute_daily_average_reviews(total, first)
+
+    source_total_raw = max(
+        stored.get("source_total_count") or 0,
+        new.get("source_total_count") or 0,
+    )
+    source_total = source_total_raw if source_total_raw > 0 else None
+
+    return {
+        "total_count": total,
+        "first_review_date": first,
+        "distinct_review_days": distinct,
+        "daily_counts": merged_dc,
+        "daily_average_reviews": daily_average,
+        "revisit_count": revisit_count,
+        "revisit_ratio": revisit_ratio,
+        "revisit_distribution": merged_rd,
+        "receipt_count": receipt_count,
+        "reply_count": reply_count,
+        "owner_receipt_reply_rate": owner_receipt_reply_rate,
+        "source_total_count": source_total,
+    }
+
+
 def upsert_visitor_reviews(place_id: str, agg: dict) -> str | None:
-    """Satellite upsert: store_visitor_reviews. Returns store_id on success, None if store not found."""
+    """Satellite upsert: store_visitor_reviews. Merges with existing row; never shrinks history."""
     store = find_store_by_place_id(place_id)
     if not store:
         return None
     store_id = store["store_id"]
+
+    existing = get_visitor_reviews(store_id)
+    merged = _merge_aggregates(existing, agg) if existing is not None else agg
+
     headers = {
         "apikey": MASTER_DB_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {MASTER_DB_SERVICE_ROLE_KEY}",
@@ -37,18 +127,18 @@ def upsert_visitor_reviews(place_id: str, agg: dict) -> str | None:
     body = {
         "store_id": store_id,
         "place_id": place_id,
-        "total_count": agg.get("total_count"),
-        "receipt_count": agg.get("receipt_count"),
-        "first_review_date": agg.get("first_review_date"),
-        "distinct_review_days": agg.get("distinct_review_days"),
-        "daily_average_reviews": agg.get("daily_average_reviews"),
-        "revisit_count": agg.get("revisit_count"),
-        "revisit_ratio": agg.get("revisit_ratio"),
-        "revisit_distribution": agg.get("revisit_distribution"),
-        "reply_count": agg.get("reply_count"),
-        "owner_receipt_reply_rate": agg.get("owner_receipt_reply_rate"),
-        "daily_counts": agg.get("daily_counts"),
-        "source_total_count": agg.get("source_total_count"),
+        "total_count": merged.get("total_count"),
+        "receipt_count": merged.get("receipt_count"),
+        "first_review_date": merged.get("first_review_date"),
+        "distinct_review_days": merged.get("distinct_review_days"),
+        "daily_average_reviews": merged.get("daily_average_reviews"),
+        "revisit_count": merged.get("revisit_count"),
+        "revisit_ratio": merged.get("revisit_ratio"),
+        "revisit_distribution": merged.get("revisit_distribution"),
+        "reply_count": merged.get("reply_count"),
+        "owner_receipt_reply_rate": merged.get("owner_receipt_reply_rate"),
+        "daily_counts": merged.get("daily_counts"),
+        "source_total_count": merged.get("source_total_count"),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
     resp = requests.post(
