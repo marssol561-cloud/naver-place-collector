@@ -2,6 +2,7 @@ import time
 import threading
 from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, Request, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -16,6 +17,14 @@ from collector import searcher, place_crawler
 from collector import visitor_batch
 
 app = FastAPI(title="Naver Place Collector API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://itdalab.com", "https://www.itdalab.com"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=False,
+)
 
 # ---------------------------------------------------------------------------
 # S3a: Async visitor-review collection — in-memory job registry
