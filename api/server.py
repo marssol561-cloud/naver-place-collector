@@ -219,18 +219,11 @@ async def collect(req: CollectRequest):
                     return _already_exists_resp(existing2["store_id"], place_id, start)
                 return await _do_crawl_and_save(store_name, address, place_id, start)
             else:
-                # 미등록 점포 → place_id=NULL, is_registered=false
-                try:
-                    region = master_db.extract_region(address)
-                    store_id, _ = master_db.upsert_store(None, store_name, address, {}, region)
-                except Exception as e:
-                    return _error_resp("DB_ERROR", f"DB 저장 오류: {e}", start)
-
+                # 검색 미등록 → stub 저장 않음, PLACE_NOT_FOUND 반환
                 return JSONResponse(content={
-                    "status": "collected_without_place",
-                    "store_id": store_id,
-                    "place_id": None,
-                    "fields_collected": 0,
+                    "status": "place_not_found",
+                    "saved": False,
+                    "message": "네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.",
                     "elapsed_seconds": _elapsed(start),
                 })
 
