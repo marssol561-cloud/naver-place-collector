@@ -1081,37 +1081,34 @@ def _extract_menu_image_flag_from_html(html: str, place_id: str) -> bool:
 
 
 def _extract_business_image_urls(html: str) -> tuple[list, object]:
-    """Apollo State images({"source":["starbucks","tpirates"]}) → (top-5 origin URLs, totalImages).
-    URL field: Image.origin (raw ldb-phinf, \\u002F decoded). Array order = display order.
-    Returns ([], None) if key absent.
+    """PlaceDetailTopPhotoItem:business_<N> blocks → (top-5 origin URLs, count).
+    count = total business TopPhotoItem blocks found (top-preview count; full 업체 total deferred).
+    URL field: origin (raw ldb-phinf, \\u002F decoded). Array order = business_1, 2, …
+    Returns ([], None) if no business blocks found.
     """
     if not html:
         return [], None
-    key_pat = re.compile(r'"images\((?:[^"\\]|\\.)*\)"\s*:\s*\{')
-    for key_m in key_pat.finditer(html):
-        key_str = html[key_m.start(): key_m.start() + 200]
-        if "starbucks" not in key_str or "tpirates" not in key_str:
+    pat = re.compile(r'"PlaceDetailTopPhotoItem:business_(\d+)"\s*:\s*\{')
+    items: list[tuple[int, str]] = []
+    for m in pat.finditer(html):
+        n = int(m.group(1))
+        # Each block is ~400 chars; 800 is ample for origin + photoType fields
+        block = html[m.end() - 1: m.end() - 1 + 800]
+        if '"photoType":"business"' not in block:
             continue
-        block_start = key_m.end() - 1
-        depth, pos = 1, block_start + 1
-        end_limit = min(len(html), block_start + 60000)
-        while pos < end_limit and depth:
-            if html[pos] == '{':
-                depth += 1
-            elif html[pos] == '}':
-                depth -= 1
-            pos += 1
-        block_str = html[block_start:pos]
-        total_m = re.search(r'"totalImages"\s*:\s*(\d+)', block_str)
-        total = int(total_m.group(1)) if total_m else None
-        origins = []
-        for om in re.finditer(r'"origin"\s*:\s*"([^"]+)"', block_str):
-            url = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), om.group(1))
-            url = url.replace('\\/', '/')
-            if 'ldb-phinf' in url or 'pstatic.net' in url:
-                origins.append(url)
-        return origins[:5], total
-    return [], None
+        origin_m = re.search(r'"origin"\s*:\s*"([^"]+)"', block)
+        if not origin_m:
+            continue
+        raw = origin_m.group(1)
+        url = re.sub(r'\\u([0-9a-fA-F]{4})', lambda x: chr(int(x.group(1), 16)), raw)
+        url = url.replace('\\/', '/')
+        if 'ldb-phinf' in url or 'pstatic.net' in url:
+            items.append((n, url))
+    if not items:
+        return [], None
+    items.sort(key=lambda x: x[0])
+    urls = [u for _, u in items]
+    return urls[:5], len(items)
 
 
 def _extract_category_from_apollo(html: str) -> str:
