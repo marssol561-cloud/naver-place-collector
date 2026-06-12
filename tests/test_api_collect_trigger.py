@@ -1,10 +1,14 @@
 """
-Unit tests for S3a: POST /api/v1/stores/{store_id}/collect-visitor-reviews
-                    GET  /api/v1/stores/{store_id}/visitor-collect-status
+Unit tests for S3a/S3b-1:
+  POST /api/v1/stores/{store_id}/collect-visitor-reviews
+  GET  /api/v1/stores/{store_id}/visitor-collect-status
+  POST /api/v1/places/{place_id}/collect-visitor-reviews
+  GET  /api/v1/places/{place_id}/visitor-collect-status
 
-All external calls (run_batch, find_store_by_id, get_visitor_reviews) are
-monkeypatched — no live DB or network.  _LAUNCHER is replaced with an inline
-synchronous runner so the background job completes before assertions run.
+All external calls (run_batch, find_store_by_id, find_store_by_place_id,
+get_visitor_reviews) are monkeypatched — no live DB or network.
+_LAUNCHER is replaced with an inline synchronous runner so the background
+job completes before assertions run.
 """
 import os
 import sys
@@ -168,5 +172,135 @@ def test_status_reports_job_and_last_collected(client, monkeypatch):
         headers=_AUTH,
     )
     body = resp.json()
+    assert body["job"]["state"] == "done"
+    assert body["last_collected"]["total_count"] == 42
+
+
+# ── S3b-1: place_id-keyed endpoints ──────────────────────────────────────────
+
+# T6 — POST /places/{place_id}/... resolves store and starts job
+def test_place_trigger_resolves_and_starts(client, monkeypatch):
+    batch_calls = []
+
+    monkeypatch.setattr(
+        _master_db, "find_store_by_place_id",
+        lambda pid: _FAKE_STORE,
+    )
+    monkeypatch.setattr(
+        _visitor_batch, "run_batch",
+        lambda pid, **kw: batch_calls.append((pid, kw)) or _FAKE_AGG,
+    )
+
+    resp = client.post(
+        "/api/v1/places/1234567890/collect-visitor-reviews?mode=full",
+        headers=_AUTH,
+    )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "started"
+    assert body["store_id"] == "store-abc"
+    assert body["mode"] == "full"
+
+    # Registry keyed by resolved store_id
+    assert _server._job_registry["store-abc"]["state"] == "done"
+    assert batch_calls == [("1234567890", {"mode": "full"})]
+
+
+# T7 — find_store_by_place_id None → 404
+def test_place_trigger_not_found(client, monkeypatch):
+    monkeypatch.setattr(
+        _master_db, "find_store_by_place_id",
+        lambda pid: None,
+    )
+
+    resp = client.post(
+        "/api/v1/places/unknown-place/collect-visitor-reviews",
+        headers=_AUTH,
+    )
+    assert resp.status_code == 404
+
+
+# T8 — invalid mode → 400
+def test_place_trigger_bad_mode(client, monkeypatch):
+    monkeypatch.setattr(
+        _master_db, "find_store_by_place_id",
+        lambda pid: _FAKE_STORE,
+    )
+
+    resp = client.post(
+        "/api/v1/places/1234567890/collect-visitor-reviews?mode=invalid",
+        headers=_AUTH,
+    )
+    assert resp.status_code == 400
+
+
+# T9 — GET /places/{place_id}/... returns job + last_collected; 404 when not found
+def test_place_status_resolves(client, monkeypatch):
+    monkeypatch.setattr(
+        _master_db, "find_store_by_place_id",
+        lambda pid: _FAKE_STORE,
+    )
+    monkeypatch.setattr(
+        _visitor_db, "get_visitor_reviews",
+        lambda sid: _FAKE_VR,
+    )
+
+    resp = client.get(
+        "/api/v1/places/1234567890/visitor-collect-status",
+        headers=_AUTH,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["store_id"] == "store-abc"
+    assert body["job"]["state"] == "idle"
+    assert body["last_collected"]["total_count"] == 42
+
+    # 404 when place not found
+    monkeypatch.setattr(
+        _master_db, "find_store_by_place_id",
+        lambda pid: None,
+    )
+    resp = client.get(
+        "/api/v1/places/unknown-place/visitor-collect-status",
+        headers=_AUTH,
+    )
+    assert resp.status_code == 404
+
+
+# T10 — store_id endpoints behavior unchanged after S3b-1 refactor
+def test_store_endpoints_unchanged(client, monkeypatch):
+    batch_calls = []
+
+    monkeypatch.setattr(
+        _master_db, "find_store_by_id",
+        lambda sid, columns=None: _FAKE_STORE,
+    )
+    monkeypatch.setattr(
+        _visitor_batch, "run_batch",
+        lambda pid, **kw: batch_calls.append((pid, kw)) or _FAKE_AGG,
+    )
+    monkeypatch.setattr(
+        _visitor_db, "get_visitor_reviews",
+        lambda sid: _FAKE_VR,
+    )
+
+    # POST store_id → 202, registry done
+    resp = client.post(
+        "/api/v1/stores/store-abc/collect-visitor-reviews?mode=incremental",
+        headers=_AUTH,
+    )
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "started"
+    assert _server._job_registry["store-abc"]["state"] == "done"
+
+    # GET store_id status → ok with last_collected
+    resp = client.get(
+        "/api/v1/stores/store-abc/visitor-collect-status",
+        headers=_AUTH,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
     assert body["job"]["state"] == "done"
     assert body["last_collected"]["total_count"] == 42

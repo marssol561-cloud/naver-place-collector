@@ -273,49 +273,11 @@ async def collect(req: CollectRequest):
 
 
 # ---------------------------------------------------------------------------
-# S3a endpoints
+# S3a/S3b-1: collection trigger helpers (shared by store_id and place_id routes)
 # ---------------------------------------------------------------------------
 
-@app.post(
-    "/api/v1/stores/{store_id}/collect-visitor-reviews",
-    dependencies=[Depends(verify_api_key)],
-)
-async def trigger_collect_visitor_reviews(
-    store_id: str,
-    mode: str = Query(default="incremental"),
-):
-    if mode not in ("incremental", "full"):
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "error_code": "INVALID_MODE",
-                "message": f"mode must be 'incremental' or 'full', got '{mode}'",
-            },
-        )
-
-    store = master_db.find_store_by_id(store_id)
-    if store is None:
-        return JSONResponse(
-            status_code=404,
-            content={
-                "status": "error",
-                "error_code": "STORE_NOT_FOUND",
-                "message": f"store_id={store_id} 없음",
-            },
-        )
-
-    place_id = store.get("place_id")
-    if not place_id:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "error",
-                "error_code": "PLACE_ID_MISSING",
-                "message": "store has no place_id",
-            },
-        )
-
+def _start_collection(store_id: str, place_id: str, mode: str) -> JSONResponse:
+    """Conflict check, registry init, launcher. Returns 202 or 409."""
     now = datetime.now(timezone.utc).isoformat()
     with _registry_lock:
         if _job_registry.get(store_id, {}).get("state") == "running":
@@ -331,7 +293,6 @@ async def trigger_collect_visitor_reviews(
             "error": None,
             "summary": None,
         }
-
     _LAUNCHER(run_collection, (store_id, place_id, mode))
     return JSONResponse(
         status_code=202,
@@ -339,11 +300,8 @@ async def trigger_collect_visitor_reviews(
     )
 
 
-@app.get(
-    "/api/v1/stores/{store_id}/visitor-collect-status",
-    dependencies=[Depends(verify_api_key)],
-)
-async def get_visitor_collect_status(store_id: str):
+def _collection_status(store_id: str) -> JSONResponse:
+    """Read registry + last_collected from visitor_db."""
     with _registry_lock:
         job = dict(_job_registry.get(store_id, {"state": "idle"}))
 
@@ -371,3 +329,108 @@ async def get_visitor_collect_status(store_id: str):
         "job": job,
         "last_collected": last_collected,
     })
+
+
+# ---------------------------------------------------------------------------
+# S3a endpoints — store_id-keyed (behavior unchanged)
+# ---------------------------------------------------------------------------
+
+_INVALID_MODE_RESP = {
+    "status": "error",
+    "error_code": "INVALID_MODE",
+    "message": "mode must be 'incremental' or 'full'",
+}
+
+
+@app.post(
+    "/api/v1/stores/{store_id}/collect-visitor-reviews",
+    dependencies=[Depends(verify_api_key)],
+)
+async def trigger_collect_visitor_reviews(
+    store_id: str,
+    mode: str = Query(default="incremental"),
+):
+    if mode not in ("incremental", "full"):
+        return JSONResponse(status_code=400, content=_INVALID_MODE_RESP)
+
+    store = master_db.find_store_by_id(store_id)
+    if store is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error_code": "STORE_NOT_FOUND",
+                "message": f"store_id={store_id} 없음",
+            },
+        )
+
+    place_id = store.get("place_id")
+    if not place_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error_code": "PLACE_ID_MISSING",
+                "message": "store has no place_id",
+            },
+        )
+
+    return _start_collection(store_id, place_id, mode)
+
+
+@app.get(
+    "/api/v1/stores/{store_id}/visitor-collect-status",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_visitor_collect_status(store_id: str):
+    return _collection_status(store_id)
+
+
+# ---------------------------------------------------------------------------
+# S3b-1 endpoints — place_id-keyed (resolve → same helpers)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/v1/places/{place_id}/collect-visitor-reviews",
+    dependencies=[Depends(verify_api_key)],
+)
+async def trigger_collect_visitor_reviews_by_place(
+    place_id: str,
+    mode: str = Query(default="incremental"),
+):
+    if mode not in ("incremental", "full"):
+        return JSONResponse(status_code=400, content=_INVALID_MODE_RESP)
+
+    store = master_db.find_store_by_place_id(place_id)
+    if store is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error_code": "STORE_NOT_FOUND",
+                "message": f"place_id={place_id} 없음",
+            },
+        )
+
+    store_id = store["store_id"]
+    return _start_collection(store_id, place_id, mode)
+
+
+@app.get(
+    "/api/v1/places/{place_id}/visitor-collect-status",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_visitor_collect_status_by_place(place_id: str):
+    store = master_db.find_store_by_place_id(place_id)
+    if store is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error_code": "STORE_NOT_FOUND",
+                "message": f"place_id={place_id} 없음",
+            },
+        )
+
+    store_id = store["store_id"]
+    return _collection_status(store_id)
