@@ -69,7 +69,7 @@ def test_run_batch_use_cache_false():
 
 
 def test_refresh_peek_gt_stored_triggers_recrawl(monkeypatch):
-    """cached complete + peek > stored → triggers full re-crawl + upsert."""
+    """cached complete + peek > stored → triggers re-crawl + upsert."""
     import db.master_db
     import db.visitor_db
     import collector.visitor_batch as vb
@@ -97,7 +97,7 @@ def test_refresh_peek_gt_stored_triggers_recrawl(monkeypatch):
     collector_called = []
     upsert_called = []
 
-    def _sentinel(place_id):
+    def _sentinel(place_id, since_date=None):
         collector_called.append(place_id)
         return []
 
@@ -295,7 +295,7 @@ def test_no_cache_full_crawl_live_path(monkeypatch):
 
     collector_called = []
 
-    def _sentinel(place_id):
+    def _sentinel(place_id, since_date=None):
         collector_called.append(place_id)
         return []
 
@@ -304,3 +304,102 @@ def test_no_cache_full_crawl_live_path(monkeypatch):
     result = run_batch("1709413013")
     assert collector_called == ["1709413013"]
     assert result["source_total_count"] is None
+
+
+# ──────────────────────────── S2b new tests ────────────────────────────
+
+def test_since_date_from_stored():
+    from collector.visitor_batch import _since_date_from_stored
+
+    # max date "2026-06-01", overlap 30 → "2026-05-02"
+    stored = {"daily_counts": {"2026-06-01": 5, "2026-05-15": 3}}
+    assert _since_date_from_stored(stored) == "2026-05-02"
+
+    # Empty daily_counts → None
+    assert _since_date_from_stored({"daily_counts": {}}) is None
+
+    # No stored → None
+    assert _since_date_from_stored(None) is None
+
+    # No daily_counts key → None
+    assert _since_date_from_stored({}) is None
+
+
+def test_incremental_merge_accumulates(monkeypatch):
+    """Partial incremental crawl merges with stored history; old dates preserved, new dates added."""
+    import db.master_db
+    import db.visitor_db
+    import collector.visitor_batch as vb
+    from db.visitor_db import _merge_aggregates
+
+    STORED = {
+        "total_count": 5,
+        "source_total_count": 5,
+        "first_review_date": "2022-01-15",
+        "distinct_review_days": 3,
+        "daily_average_reviews": 0.01,
+        "revisit_count": 0,
+        "revisit_ratio": 0.0,
+        "revisit_distribution": {},
+        "reply_count": 0,
+        "owner_receipt_reply_rate": 0.0,
+        "daily_counts": {"2022-01-15": 2, "2022-01-20": 2, "2026-06-01": 1},
+        "receipt_count": 0,
+    }
+
+    partial_items = [
+        {"representativeVisitDateTime": "2026-06-02T10:00:00", "visitCount": 1,
+         "originType": "영수증", "has_owner_reply": False},
+        {"representativeVisitDateTime": "2026-06-03T10:00:00", "visitCount": 1,
+         "originType": "영수증", "has_owner_reply": False},
+    ]
+
+    monkeypatch.setattr(db.master_db, "find_store_by_place_id", lambda pid: {"store_id": "S1"})
+    monkeypatch.setattr(db.visitor_db, "get_visitor_reviews", lambda sid: STORED)
+
+    captured_merges = []
+
+    def _capture_upsert(pid, agg):
+        merged = _merge_aggregates(STORED, agg)
+        captured_merges.append(merged)
+
+    monkeypatch.setattr(db.visitor_db, "upsert_visitor_reviews", _capture_upsert)
+
+    def _stub_collect(place_id, since_date=None):
+        return {"items": partial_items, "source_total_count": 7}
+
+    monkeypatch.setattr(vb, "collect_visitor_reviews", _stub_collect)
+
+    run_batch("1709413013", mode="incremental")
+
+    assert len(captured_merges) == 1
+    dc = captured_merges[0]["daily_counts"]
+
+    # Old 2022 dates preserved
+    assert "2022-01-15" in dc
+    assert "2022-01-20" in dc
+    assert "2026-06-01" in dc
+
+    # New 2026-06 dates added
+    assert "2026-06-02" in dc
+    assert "2026-06-03" in dc
+
+    # total_count does not shrink
+    assert captured_merges[0]["total_count"] >= 5
+
+
+def test_full_mode_unchanged(monkeypatch):
+    """mode='full' always passes since_date=None to the live collector."""
+    import collector.visitor_batch as vb
+
+    calls = []
+
+    def _stub_collect(place_id, since_date=None):
+        calls.append(since_date)
+        return {"items": [], "source_total_count": 5}
+
+    monkeypatch.setattr(vb, "collect_visitor_reviews", _stub_collect)
+
+    run_batch("1709413013", mode="full")
+
+    assert calls == [None]

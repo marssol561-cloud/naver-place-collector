@@ -14,6 +14,7 @@ from config import PROXY_URL
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 REF_TOTALS = {"blog": 281, "visitor": 1159}
+INCREMENTAL_OVERLAP_DAYS = 30
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -53,6 +54,13 @@ def deep_find(obj, key, depth=0):
             if r is not None:
                 return r
     return None
+
+
+def _should_stop_incremental(oldest_visit_date: str | None, since_date: str | None) -> bool:
+    """True when oldest_visit_date is strictly older than since_date."""
+    if not since_date or not oldest_visit_date:
+        return False
+    return oldest_visit_date[:10] < since_date[:10]
 
 
 async def human_delay(min_s=1.5, max_s=3.0):
@@ -173,7 +181,7 @@ def log_gql_ops(all_captures, start_idx, log_fn):
 
 # ─────────────────────────── main tab processor ───────────────────────────
 
-async def process_tab(page, tab_name, all_captures, log_fn, place_id):
+async def process_tab(page, tab_name, all_captures, log_fn, place_id, since_date=None):
     """
     Full expand loop for one review tab.
     Returns (items_deduped, meta_dict).
@@ -316,6 +324,18 @@ async def process_tab(page, tab_name, all_captures, log_fn, place_id):
         log_fn(f"[CLICK #{click_count}] +{new_count}건, "
                f"누계={len(items_raw)}/{api_total}")
 
+        # Incremental watermark check
+        if since_date is not None:
+            dates = [
+                it.get("representativeVisitDateTime", "")[:10]
+                for it in items_raw
+                if it.get("representativeVisitDateTime")
+            ]
+            oldest = min(dates) if dates else None
+            if _should_stop_incremental(oldest, since_date):
+                log_fn("[INCR] reached watermark, stop")
+                break
+
         # Consecutive-empty guard (server returned items=[] twice → treat as end)
         if new_count == 0:
             consecutive_empty += 1
@@ -402,7 +422,7 @@ async def process_tab(page, tab_name, all_captures, log_fn, place_id):
 
 # ─────────────────────────── public API ───────────────────────────
 
-async def collect_visitor_items(place_id):
+async def collect_visitor_items(place_id, since_date=None):
     """Headed Playwright collection of visitor reviews for place_id.
     Returns dict {"items": list[dict], "source_total_count": int|None}."""
 
@@ -454,7 +474,8 @@ async def collect_visitor_items(place_id):
 
             page_v = await ctx.new_page()
             visitor_items, _meta = await process_tab(
-                page_v, "visitor", all_captures, log_fn, place_id
+                page_v, "visitor", all_captures, log_fn, place_id,
+                since_date=since_date,
             )
             await page_v.close()
 
