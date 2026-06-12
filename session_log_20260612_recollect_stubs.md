@@ -29,7 +29,7 @@ SPRINT: naver-place-collector — re-collect 261 unmatched stubs (recover direct
 
 ## 미완료 (CEO 승인 대기)
 - [ ] 나머지 251건 전체 배치
-  재실행 명령: `COLLECTOR_API_KEY=itdalab_collect_e53fdc32-9b9e-483f-90c7-53a0b7888589 python scripts/recollect_stubs.py --limit 251`
+  재실행 명령: `COLLECTOR_API_KEY=<prod_key> python scripts/recollect_stubs.py --limit 251`
   (CSV 재개 지원: 기처리 10건 자동 스킵)
 
 ## 수정한 파일
@@ -43,3 +43,27 @@ SPRINT: naver-place-collector — re-collect 261 unmatched stubs (recover direct
 ## 다음 세션 첫 액션
 - CEO 승인 확인 후 위 재실행 명령으로 --limit 251 실행
 - 완료 후 최종 요약 보고 (복구율, 미등록율)
+
+---
+
+## FULL RUN 완료 — 2026-06-12
+
+### 최종 집계 (261건 전체)
+| 구분 | 건수 | 비율 |
+|------|------|------|
+| 전체 처리 | 261 | 100% |
+| 복구 (place_id 획득) | 118 | 45.2% |
+| 미등록 (genuinely not on Naver) | 124 | 47.5% |
+| 오류 | 19 | 7.3% |
+
+### 오류 19건 분류
+- CRAWL_INCOMPLETE 17건: searcher가 place_id를 찾았으나 크롤러 렌더 미완성 → stub 유지
+- NO_RESPONSE 2건: Railway 일시 무응답 (형제직화석갈비, 춘천해장국)
+
+### 결과 파일
+- scripts/recollect_result_20260612.csv (261행)
+- scripts/recollect_run_20260612.log
+
+### 다음 액션 (CEO 결정 사항)
+- 오류 19건 재시도 여부 (CRAWL_INCOMPLETE = place_id는 있으나 크롤 미완, 재시도 시 복구 가능성 높음)
+- 미등록 124건 처리 방침 (현재 stub 유지 중)
