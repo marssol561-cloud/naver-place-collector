@@ -1,4 +1,6 @@
 import time
+import threading
+from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, Request, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -9,10 +11,49 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import COLLECTOR_API_KEY
 from db import master_db
+from db import visitor_db
 from collector import searcher, place_crawler
 from collector import visitor_batch
 
 app = FastAPI(title="Naver Place Collector API")
+
+# ---------------------------------------------------------------------------
+# S3a: Async visitor-review collection — in-memory job registry
+# ---------------------------------------------------------------------------
+
+_job_registry: dict = {}
+_registry_lock = threading.Lock()
+
+
+def _default_launcher(target, args):
+    t = threading.Thread(target=target, args=args, daemon=True)
+    t.start()
+
+
+_LAUNCHER = _default_launcher
+
+
+def run_collection(store_id: str, place_id: str, mode: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _registry_lock:
+        _job_registry[store_id]["state"] = "running"
+        _job_registry[store_id]["started_at"] = now
+    try:
+        agg = visitor_batch.run_batch(place_id, mode=mode)
+        finished = datetime.now(timezone.utc).isoformat()
+        with _registry_lock:
+            _job_registry[store_id]["state"] = "done"
+            _job_registry[store_id]["finished_at"] = finished
+            _job_registry[store_id]["summary"] = {
+                "total_count": agg.get("total_count"),
+                "captured_at": finished,
+            }
+    except Exception as e:
+        finished = datetime.now(timezone.utc).isoformat()
+        with _registry_lock:
+            _job_registry[store_id]["state"] = "error"
+            _job_registry[store_id]["finished_at"] = finished
+            _job_registry[store_id]["error"] = str(e)
 
 
 class AuthFailedException(Exception):
@@ -229,3 +270,104 @@ async def collect(req: CollectRequest):
 
     except Exception as e:
         return _error_resp("CRAWL_FAILED", f"처리 중 오류: {e}", start)
+
+
+# ---------------------------------------------------------------------------
+# S3a endpoints
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/v1/stores/{store_id}/collect-visitor-reviews",
+    dependencies=[Depends(verify_api_key)],
+)
+async def trigger_collect_visitor_reviews(
+    store_id: str,
+    mode: str = Query(default="incremental"),
+):
+    if mode not in ("incremental", "full"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error_code": "INVALID_MODE",
+                "message": f"mode must be 'incremental' or 'full', got '{mode}'",
+            },
+        )
+
+    store = master_db.find_store_by_id(store_id)
+    if store is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "error_code": "STORE_NOT_FOUND",
+                "message": f"store_id={store_id} 없음",
+            },
+        )
+
+    place_id = store.get("place_id")
+    if not place_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error_code": "PLACE_ID_MISSING",
+                "message": "store has no place_id",
+            },
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _registry_lock:
+        if _job_registry.get(store_id, {}).get("state") == "running":
+            return JSONResponse(
+                status_code=409,
+                content={"status": "already_running"},
+            )
+        _job_registry[store_id] = {
+            "state": "running",
+            "mode": mode,
+            "started_at": now,
+            "finished_at": None,
+            "error": None,
+            "summary": None,
+        }
+
+    _LAUNCHER(run_collection, (store_id, place_id, mode))
+    return JSONResponse(
+        status_code=202,
+        content={"status": "started", "store_id": store_id, "mode": mode},
+    )
+
+
+@app.get(
+    "/api/v1/stores/{store_id}/visitor-collect-status",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_visitor_collect_status(store_id: str):
+    with _registry_lock:
+        job = dict(_job_registry.get(store_id, {"state": "idle"}))
+
+    try:
+        row = visitor_db.get_visitor_reviews(store_id)
+    except Exception:
+        row = None
+
+    if row is not None:
+        last_collected = {
+            "captured_at": row.get("captured_at"),
+            "total_count": row.get("total_count"),
+            "first_review_date": row.get("first_review_date"),
+        }
+    else:
+        last_collected = {
+            "captured_at": None,
+            "total_count": None,
+            "first_review_date": None,
+        }
+
+    return JSONResponse(content={
+        "status": "ok",
+        "store_id": store_id,
+        "job": job,
+        "last_collected": last_collected,
+    })
