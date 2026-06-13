@@ -100,11 +100,12 @@ async def find_expand_btn(page):
 
 
 async def click_sort_latest(page, log_fn):
-    """Click 최신순; return (success, raw_outerHTML)."""
+    """Click 최신순; return (success, raw_outerHTML).
+    Per-attempt timeout capped at 6 s so 3 failures cost ≤ ~21 s total."""
     for attempt in range(3):
         try:
             btn = page.get_by_text("최신순", exact=True).first
-            raw_html = await btn.evaluate("el => el.outerHTML")
+            raw_html = await btn.evaluate("el => el.outerHTML", timeout=6_000)
             log_fn(f"[SORT] 최신순 outerHTML: {raw_html}")
             await btn.click()
             await asyncio.sleep(2.5)
@@ -248,9 +249,11 @@ async def process_tab(page, tab_name, all_captures, log_fn, place_id, since_date
     # Log all GQL ops detected so far (diagnostic)
     log_gql_ops(all_captures, nav_pre, log_fn)
 
-    # Extract initial batch (everything from pre_sort onward captures the
-    # sort re-fetch + any scroll-triggered first page)
-    init_batches = extract_batches(all_captures, pre_sort, op_name, gql_key)
+    # Extract initial batch starting from nav_pre so that getVisitorReviews
+    # responses captured during the anchor-fallback goto (indices in
+    # [nav_pre, pre_sort)) are included. The id-dedup pass below removes any
+    # duplicates that also appear in the later sort re-fetch.
+    init_batches = extract_batches(all_captures, nav_pre, op_name, gql_key)
     if init_batches:
         api_total = init_batches[0].get("total")
         for b in init_batches:
