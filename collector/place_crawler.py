@@ -514,6 +514,73 @@ def _fac_norm_key(s: str) -> str:
     return re.sub(r'\s+', '', re.sub(r'\s*\([^)]*\)\s*$', '', s))
 
 
+def extract_facility_services(html: str) -> list:
+    """Extract facility labels from the rendered '편의시설 및 서비스' section.
+
+    Takes rendered body HTML from entry_frame.evaluate("document.body.outerHTML").
+    Finds the section by the stable CSS class 'place_section_header_title', then
+    extracts <li> text items scoped to that section only — excluding adjacent sections
+    like '결제수단'/'간편결제' that share the same parent div.
+
+    DOM structure (Naver pcmap, as of 2026-06-13):
+      <div class="place_section ...">
+        <h2 class="place_section_header">
+          <div class="place_section_header_title">편의시설 및 서비스<em ...>N</em></div>
+        </h2>
+        <div class="place_section_content">
+          <ul>
+            <li><svg aria-hidden="true">...</svg><div>LABEL</div>[<em>fee_tag</em>]</li>
+            ...
+          </ul>
+        </div>
+      </div>
+
+    SVG elements carry no text (aria-hidden, path-only).
+    Fee-tagged items (e.g. "콜키지 가능 (유료)") have the fee rendered as a separate
+    sibling element — li.get_text(separator="\\n") splits them; they are rejoined as
+    "label (fee_text)" to preserve the Apollo-State-compatible format.
+    Returns labels in display order. Returns [] if section not found.
+    """
+    if not html:
+        return []
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    target_section = None
+    for div in soup.find_all("div", class_="place_section_header_title"):
+        if "편의시설 및 서비스" in div.get_text():
+            node = div.parent
+            while node and getattr(node, "name", None) not in (None, "body", "[document]"):
+                if "place_section" in (node.get("class") or []):
+                    target_section = node
+                    break
+                node = node.parent
+            break
+
+    if not target_section:
+        return []
+
+    labels = []
+    _has_korean = re.compile(r'[가-힣]')
+    for li in target_section.find_all("li"):
+        # Use "\n" separator so fee-tag sub-elements appear as separate chunks.
+        parts = [p for p in li.get_text(separator="\n", strip=True).split("\n") if p]
+        # Keep only parts that contain Korean — filters out icon/CSS artifact chars (e.g. "\").
+        korean_parts = [p for p in parts if _has_korean.search(p)]
+        if not korean_parts:
+            continue
+        if len(korean_parts) == 1:
+            labels.append(korean_parts[0])
+        else:
+            # First Korean part = main label, second = fee sub-label (e.g. "유료").
+            labels.append(f"{korean_parts[0]} ({korean_parts[1]})")
+    return labels
+
+
 def _extract_facilities_from_info_html(html: str) -> list:
     """Extract facility labels from /information tab InformationFacilities objects.
 
@@ -1523,6 +1590,10 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         await page.wait_for_timeout(2000)
                         _info_text = await entry_frame.locator("body").inner_text(timeout=5000)
                         _info_html = await entry_frame.content()
+                        # ISSUE1 (2026-06-13): rendered body HTML for section-scoped extractor.
+                        # content() returns un-hydrated HTML (Apollo State only); body.outerHTML
+                        # has the React-rendered DOM needed by extract_facility_services.
+                        _info_body_html = await entry_frame.evaluate("document.body.outerHTML")
                         if not result["parking"]:
                             result["parking"] = _extract_parking(_info_text)
                         if not result["closed_days"]:
@@ -1533,22 +1604,27 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         _pinfo = _extract_parking_info_from_html(_info_html)
                         result["parking_description"] = _pinfo.get("description", "")
                         result["parking_is_free"] = _pinfo.get("is_free", "")
-                        # RC-3 (2026-06-06): normalized merge — INFO fee tags upgrade CONV labels;
-                        # CONV backfills items absent from a partial InformationFacilities cache.
-                        _info_fac = _extract_facilities_from_info_html(_info_html)
-                        if _info_fac:
-                            _info_d = {_fac_norm_key(x): x for x in _info_fac}
-                            _merged, _seen_nk = [], set()
-                            for _item in (_conv or []):
-                                _nk = _fac_norm_key(_item)
-                                if _nk not in _seen_nk:
-                                    _merged.append(_info_d.get(_nk, _item))
-                                    _seen_nk.add(_nk)
-                            for _nk, _lbl in _info_d.items():
-                                if _nk not in _seen_nk:
-                                    _merged.append(_lbl)
-                                    _seen_nk.add(_nk)
-                            result["facilities"] = json.dumps(_merged, ensure_ascii=False)
+                        # ISSUE1 (2026-06-13): use rendered section extractor as primary;
+                        # fall back to Apollo-parse + CONV merge (RC-3) when section not found.
+                        _fac_rendered = extract_facility_services(_info_body_html)
+                        if _fac_rendered:
+                            result["facilities"] = json.dumps(_fac_rendered, ensure_ascii=False)
+                        else:
+                            # Fallback: RC-3 Apollo-parse merge
+                            _info_fac = _extract_facilities_from_info_html(_info_html)
+                            if _info_fac:
+                                _info_d = {_fac_norm_key(x): x for x in _info_fac}
+                                _merged, _seen_nk = [], set()
+                                for _item in (_conv or []):
+                                    _nk = _fac_norm_key(_item)
+                                    if _nk not in _seen_nk:
+                                        _merged.append(_info_d.get(_nk, _item))
+                                        _seen_nk.add(_nk)
+                                for _nk, _lbl in _info_d.items():
+                                    if _nk not in _seen_nk:
+                                        _merged.append(_lbl)
+                                        _seen_nk.add(_nk)
+                                result["facilities"] = json.dumps(_merged, ensure_ascii=False)
 
                     # naedon blog fields — getFsasReviews buyWithMyMoneyType capture
                     _naedon_count, _naedon_date = await _collect_naedon_blog_fields(
