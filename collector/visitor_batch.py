@@ -102,7 +102,13 @@ def run_batch(place_id, collector=None, use_cache=True, mode="auto"):
     # Save to satellite table — only when using live collector and cache enabled
     if use_cache and collector is None:
         try:
+            from datetime import datetime, timezone
             from db.visitor_db import upsert_visitor_reviews
+            _now = datetime.now(timezone.utc).isoformat()
+            if since_date is None:
+                agg["last_full_collected_at"] = _now
+            else:
+                agg["last_incremental_collected_at"] = _now
             upsert_visitor_reviews(place_id, agg)
         except Exception:
             pass  # non-fatal

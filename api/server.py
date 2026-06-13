@@ -330,12 +330,16 @@ def _collection_status(store_id: str) -> JSONResponse:
             "captured_at": row.get("captured_at"),
             "total_count": row.get("total_count"),
             "first_review_date": row.get("first_review_date"),
+            "last_full_collected_at": row.get("last_full_collected_at"),
+            "last_incremental_collected_at": row.get("last_incremental_collected_at"),
         }
     else:
         last_collected = {
             "captured_at": None,
             "total_count": None,
             "first_review_date": None,
+            "last_full_collected_at": None,
+            "last_incremental_collected_at": None,
         }
 
     return JSONResponse(content={

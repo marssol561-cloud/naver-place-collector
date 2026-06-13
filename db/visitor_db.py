@@ -92,6 +92,10 @@ def _merge_aggregates(stored: dict, new: dict) -> dict:
     )
     source_total = source_total_raw if source_total_raw > 0 else None
 
+    # Timestamps: take new value when set; otherwise keep stored (never overwrite with None)
+    last_full = new.get("last_full_collected_at") or stored.get("last_full_collected_at")
+    last_incr = new.get("last_incremental_collected_at") or stored.get("last_incremental_collected_at")
+
     return {
         "total_count": total,
         "first_review_date": first,
@@ -105,6 +109,8 @@ def _merge_aggregates(stored: dict, new: dict) -> dict:
         "reply_count": reply_count,
         "owner_receipt_reply_rate": owner_receipt_reply_rate,
         "source_total_count": source_total,
+        "last_full_collected_at": last_full,
+        "last_incremental_collected_at": last_incr,
     }
 
 
@@ -139,6 +145,8 @@ def upsert_visitor_reviews(place_id: str, agg: dict) -> str | None:
         "owner_receipt_reply_rate": merged.get("owner_receipt_reply_rate"),
         "daily_counts": merged.get("daily_counts"),
         "source_total_count": merged.get("source_total_count"),
+        "last_full_collected_at": merged.get("last_full_collected_at"),
+        "last_incremental_collected_at": merged.get("last_incremental_collected_at"),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
     resp = requests.post(
@@ -158,7 +166,8 @@ def get_visitor_reviews(store_id: str) -> dict | None:
                 "place_id,total_count,receipt_count,first_review_date,"
                 "distinct_review_days,daily_average_reviews,revisit_count,"
                 "revisit_ratio,revisit_distribution,reply_count,"
-                "owner_receipt_reply_rate,daily_counts,source_total_count,captured_at"
+                "owner_receipt_reply_rate,daily_counts,source_total_count,"
+                "last_full_collected_at,last_incremental_collected_at,captured_at"
             ),
             "store_id": f"eq.{store_id}",
         },
