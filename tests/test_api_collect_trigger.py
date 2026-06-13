@@ -268,6 +268,100 @@ def test_place_status_resolves(client, monkeypatch):
     assert resp.status_code == 404
 
 
+# ── S4a: name+address trigger ────────────────────────────────────────────────
+
+# T11 — POST resolves store, starts collection; 202 includes store_id+place_id; reaches "done"
+def test_by_store_resolves_and_starts(client, monkeypatch):
+    batch_calls = []
+    monkeypatch.setattr(
+        _master_db, "find_store_by_name_address",
+        lambda name, addr: _FAKE_STORE,
+    )
+    monkeypatch.setattr(
+        _visitor_batch, "run_batch",
+        lambda pid, **kw: batch_calls.append((pid, kw)) or _FAKE_AGG,
+    )
+
+    resp = client.post(
+        "/api/v1/collect-visitor-reviews-by-store",
+        json={"store_name": "테스트점포", "address": "서울 강남구 역삼동", "mode": "full"},
+        headers=_AUTH,
+    )
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["status"] == "started"
+    assert body["store_id"] == "store-abc"
+    assert body["place_id"] == "1234567890"
+    assert _server._job_registry["store-abc"]["state"] == "done"
+    assert batch_calls == [("1234567890", {"mode": "full"})]
+
+
+# T12 — find_store_by_name_address None → 404 STORE_NOT_FOUND
+def test_by_store_not_found(client, monkeypatch):
+    monkeypatch.setattr(
+        _master_db, "find_store_by_name_address",
+        lambda name, addr: None,
+    )
+
+    resp = client.post(
+        "/api/v1/collect-visitor-reviews-by-store",
+        json={"store_name": "없는점포", "address": "서울 강남구"},
+        headers=_AUTH,
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "STORE_NOT_FOUND"
+
+
+# T13 — store has no place_id → 404 PLACE_ID_MISSING
+def test_by_store_no_place_id(client, monkeypatch):
+    monkeypatch.setattr(
+        _master_db, "find_store_by_name_address",
+        lambda name, addr: {"store_id": "store-abc", "place_id": None},
+    )
+
+    resp = client.post(
+        "/api/v1/collect-visitor-reviews-by-store",
+        json={"store_name": "테스트점포", "address": "서울 강남구"},
+        headers=_AUTH,
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error_code"] == "PLACE_ID_MISSING"
+
+
+# T14 — invalid mode → 400
+def test_by_store_bad_mode(client, monkeypatch):
+    resp = client.post(
+        "/api/v1/collect-visitor-reviews-by-store",
+        json={"store_name": "테스트점포", "address": "서울 강남구", "mode": "invalid"},
+        headers=_AUTH,
+    )
+    assert resp.status_code == 400
+
+
+# T15 — second call while running → 409 already_running
+def test_by_store_already_running(client, monkeypatch):
+    monkeypatch.setattr(
+        _master_db, "find_store_by_name_address",
+        lambda name, addr: _FAKE_STORE,
+    )
+    _server._job_registry["store-abc"] = {
+        "state": "running",
+        "mode": "incremental",
+        "started_at": "2026-06-13T00:00:00+00:00",
+        "finished_at": None,
+        "error": None,
+        "summary": None,
+    }
+
+    resp = client.post(
+        "/api/v1/collect-visitor-reviews-by-store",
+        json={"store_name": "테스트점포", "address": "서울 강남구"},
+        headers=_AUTH,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["status"] == "already_running"
+
+
 # T10 — store_id endpoints behavior unchanged after S3b-1 refactor
 def test_store_endpoints_unchanged(client, monkeypatch):
     batch_calls = []

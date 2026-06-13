@@ -93,6 +93,12 @@ class CollectRequest(BaseModel):
     force_refresh: bool = False
 
 
+class CollectByStoreRequest(BaseModel):
+    store_name: str
+    address: str
+    mode: str = "incremental"
+
+
 def _elapsed(start: float) -> float:
     return round(time.monotonic() - start, 1)
 
@@ -443,3 +449,43 @@ async def get_visitor_collect_status_by_place(place_id: str):
 
     store_id = store["store_id"]
     return _collection_status(store_id)
+
+
+# ---------------------------------------------------------------------------
+# S4a: name+address trigger — resolves via master DB, delegates to _start_collection
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/collect-visitor-reviews-by-store", dependencies=[Depends(verify_api_key)])
+async def collect_visitor_reviews_by_store(req: CollectByStoreRequest):
+    if req.mode not in ("incremental", "full"):
+        return JSONResponse(status_code=400, content=_INVALID_MODE_RESP)
+
+    if not req.store_name or not req.address:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error_code": "INVALID_REQUEST", "message": "store_name and address are required"},
+        )
+
+    store = master_db.find_store_by_name_address(req.store_name, req.address)
+    if store is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "error_code": "STORE_NOT_FOUND"},
+        )
+
+    store_id = store["store_id"]
+    place_id = store.get("place_id")
+
+    if not place_id:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "error_code": "PLACE_ID_MISSING"},
+        )
+
+    result = _start_collection(store_id, place_id, req.mode)
+    if result.status_code == 202:
+        return JSONResponse(
+            status_code=202,
+            content={"status": "started", "store_id": store_id, "place_id": place_id, "mode": req.mode},
+        )
+    return result
