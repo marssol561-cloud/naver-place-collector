@@ -104,6 +104,17 @@ def _extract_review_count(text: str, label: str) -> str:
     return match.group(1) if match else ""
 
 
+def _extract_blog_review_count_from_html(html: str) -> str:
+    """Apollo State 블로그 리뷰 수 추출. 신규 키 cafeBlogReviewsTotal 우선, 레거시 blogReviewCount 폴백. 0/미발견 시 ''."""
+    if not html:
+        return ""
+    for pat in (r'"cafeBlogReviewsTotal"\s*:\s*(\d+)', r'"blogReviewCount"\s*:\s*(\d+)'):
+        _m = re.search(pat, html)
+        if _m and int(_m.group(1)) > 0:
+            return _m.group(1)
+    return ""
+
+
 def _extract_address(text: str) -> str:
     compact = _compact_text(text)
     prefixes = "|".join(re.escape(p) for p in ADDRESS_PREFIXES)
@@ -1491,9 +1502,13 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                                 break
 
                     if not result["blog_review_count"]:
-                        _m = re.search(r'"blogReviewCount"\s*:\s*(\d+)', html_content)
-                        if _m and int(_m.group(1)) > 0:
-                            result["blog_review_count"] = _m.group(1)
+                        _bc = _extract_blog_review_count_from_html(html_content)
+                        if _bc:
+                            result["blog_review_count"] = _bc
+                            result["total_reviews"] = compute_total_reviews(
+                                result["visitor_review_count"],
+                                result["blog_review_count"],
+                            )
 
                     if not result["photo_count"]:
                         for _pp in [r'"photoCount"\s*:\s*(\d+)',
