@@ -1204,6 +1204,116 @@ def _extract_business_image_urls(html: str) -> tuple[list, object]:
     return urls[:5], len(items)
 
 
+async def _fetch_business_photo_total(
+    page,
+    entry_frame,
+    place_id: str,
+    ptype: str = "restaurant",
+) -> int | None:
+    """Fetch actual business photo total via getPhotoViewerItems(filter='업체').
+
+    Navigates to /photo tab, clicks '업체' category, collects GQL responses,
+    pages by scrolling until cursors[id='biz'].hasNext == False or hard cap reached.
+    Returns total count (int >= 1) or None on any error/block.
+    ISOLATION: never raises; all exceptions caught internally.
+    Rate-limit safe: ≥3s between scroll pages; aborts on 429 (JSON parse fails → skipped).
+    """
+    _collected: list = []
+
+    async def _on_response(response):
+        if "graphql" not in response.url or "naver.com" not in response.url:
+            return
+        try:
+            pd = response.request.post_data or ""
+        except Exception:
+            return
+        if '"operationName":"getPhotoViewerItems"' not in pd or '"filter":"업체"' not in pd:
+            return
+        try:
+            body = await response.json()
+            _collected.append(body)
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+    try:
+        photo_url = f"https://pcmap.place.naver.com/{ptype}/{place_id}/photo"
+        try:
+            await entry_frame.goto(photo_url, wait_until="networkidle", timeout=20_000)
+        except Exception as _ge:
+            print(f"[업체사진] /photo 탭 이동 실패: {_ge}")
+            return None
+        await page.wait_for_timeout(3000)
+
+        # Click "업체" category tab
+        clicked = False
+        for _sel in ["a:has-text('업체')", "button:has-text('업체')", "span:has-text('업체')"]:
+            try:
+                _el = entry_frame.locator(_sel).first
+                if await _el.count() > 0:
+                    await _el.click()
+                    clicked = True
+                    break
+            except Exception:
+                pass
+        if not clicked:
+            print(f"[업체사진] '업체' 탭 클릭 실패 place_id={place_id}")
+            return None
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(3000)
+
+        if not _collected:
+            print(f"[업체사진] GQL 응답 없음 place_id={place_id}")
+            return None
+
+        def _parse_pv(resp):
+            """Returns (photos_count, has_next) from a getPhotoViewerItems response."""
+            items = resp if isinstance(resp, list) else [resp]
+            for item in items:
+                if not isinstance(item, dict) or "data" not in item:
+                    continue
+                pv = (item["data"].get("photoViewer") or {})
+                photos = pv.get("photos") or []
+                cursors = pv.get("cursors") or []
+                biz = next((c for c in cursors if isinstance(c, dict) and c.get("id") == "biz"), {})
+                return len(photos), bool(biz.get("hasNext"))
+            return 0, False
+
+        total = 0
+        has_next = False
+        for _r in _collected:
+            _cnt, _hn = _parse_pv(_r)
+            total += _cnt
+            has_next = _hn
+
+        _HARD_CAP = 50
+        _scroll_n = 0
+        while has_next and _scroll_n < _HARD_CAP:
+            _scroll_n += 1
+            _prev_len = len(_collected)
+            await page.keyboard.press("End")
+            await page.wait_for_timeout(3000)  # ≥3s mandatory between pages
+            _new = _collected[_prev_len:]
+            if not _new:
+                break
+            for _r in _new:
+                _cnt, _hn = _parse_pv(_r)
+                total += _cnt
+                has_next = _hn
+
+        return total if total > 0 else None
+
+    except Exception as _e:
+        print(f"[업체사진] 조회 오류 ({type(_e).__name__}): {str(_e)[:80]}")
+        return None
+    finally:
+        page.remove_listener("response", _on_response)
+
+
 def _extract_category_from_apollo(html: str) -> str:
     """Apollo State PlaceDetailResult / PlaceHomeResult 앵커 기준 2000자 이내에서 category 탐색.
     DOM → HTML → GQL 폴백 모두 실패 시 최종 단계로 호출된다.
@@ -1540,6 +1650,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # _find_entry_frame 재호출 없이 entry_frame 직접 사용 (메뉴 클릭 후 frame 상태 변경 방지)
                 # 홈: visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
                 # 리뷰: visitorReviews.total → visitor_review_total (방문자 전용 카운트 폴백)
+                _ptype = "restaurant"  # default; overridden below from entry_frame URL
                 try:
                     _m_pt = re.search(r"pcmap\.place\.naver\.com/([a-z]+)/", entry_frame.url)
                     _ptype = _m_pt.group(1) if _m_pt else "restaurant"
@@ -1709,6 +1820,20 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 _biz_urls, _biz_count = _extract_business_image_urls(html_content)
                 result["business_image_urls"] = _biz_urls
                 result["business_photo_count"] = _biz_count
+
+                # Fetch actual business photo total via getPhotoViewerItems(filter='업체').
+                # Overrides preview-based count when fetch succeeds; falls back on any error.
+                try:
+                    _real_biz_total = await _fetch_business_photo_total(
+                        page, entry_frame, place_id, _ptype
+                    )
+                    if _real_biz_total is not None:
+                        result["business_photo_count"] = _real_biz_total
+                except Exception as _bpte:
+                    print(
+                        f"[업체사진] total 조회 실패 (폴백 유지) "
+                        f"{type(_bpte).__name__}: {str(_bpte)[:80]}"
+                    )
 
                 # 실제 점포 데이터가 없으면 실패로 처리
                 has_data = any([
