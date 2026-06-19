@@ -368,6 +368,19 @@ def compute_receipt_ratio(visitor: str, blog: str) -> str:
         return ""
 
 
+def _extract_total_review_from_body(body_text: str) -> str:
+    """body_text 상단 '카테고리리뷰 N' 에서 네이버 UI 표시 전체 리뷰 수 추출.
+    '육류,고기요리리뷰 344' → '344'. 방문자/블로그 prefix 제외. 첫 200자 내 탐색."""
+    head = body_text[:200]
+    for m in re.finditer(r'([가-힣A-Za-z0-9,&·/]+)리뷰\s*([\d,]+)', head):
+        if "방문자" in m.group(1) or "블로그" in m.group(1):
+            continue
+        val = m.group(2).replace(",", "")
+        if val.isdigit() and int(val) > 0:
+            return val
+    return ""
+
+
 def _extract_parking(text: str) -> str:
     """주차 정보 추출. '주차불가' / '주차가능' / 'Y'(언급만 있고 구분 불명) 반환"""
     compact = _compact_text(text)
@@ -744,7 +757,10 @@ def extract_menu_items(text: str) -> str:
         return ""
     items = []
     previous_end = 0
-    for match in PRICE_PATTERN.finditer(compact):
+    _nav = list(re.finditer(r'홈\s*소식\s*메뉴\s*리뷰\s*사진\s*정보', compact))
+    if _nav:
+        previous_end = _nav[-1].end()
+    for match in PRICE_PATTERN.finditer(compact, previous_end):
         raw_name = compact[previous_end: match.start()].strip()
         if len(raw_name) > 120:
             raw_name = raw_name[-120:]
@@ -1456,10 +1472,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["coupon_active"] = extract_yes_no_keyword(combined_text, "쿠폰")
                 result["photo_count"] = extract_photo_count(body_text, img_count)
                 result["directions"] = extract_directions(body_text)
-                result["total_reviews"] = compute_total_reviews(
-                    result["visitor_review_count"],
-                    result["blog_review_count"],
-                )
+                result["total_reviews"] = _extract_total_review_from_body(body_text)
                 # 스마트콜: 전화번호가 0507- 로 시작하면 Y, 아니면 N
                 if result["phone"]:
                     result["smartcall_active"] = "Y" if result["phone"].startswith("0507-") else "N"
@@ -1505,10 +1518,6 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         _bc = _extract_blog_review_count_from_html(html_content)
                         if _bc:
                             result["blog_review_count"] = _bc
-                            result["total_reviews"] = compute_total_reviews(
-                                result["visitor_review_count"],
-                                result["blog_review_count"],
-                            )
 
                     if not result["photo_count"]:
                         for _pp in [r'"photoCount"\s*:\s*(\d+)',
@@ -1663,16 +1672,12 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
 
                 # GQL 보강 필드 추출 및 병합
                 gql_extras = _parse_gql_extras(gql_responses)
-                # visitor_review_count GQL 폴백 (DOM 미추출 시)
-                if not result["visitor_review_count"]:
-                    result["visitor_review_count"] = gql_extras.get("visitor_review_total", "")
-                # total_reviews = visitor + blog (GQL 폴백 포함 — 재동기화)
-                if result["visitor_review_count"]:
-                    result["total_reviews"] = compute_total_reviews(
-                        result["visitor_review_count"],
-                        result["blog_review_count"],
-                    )
-                elif not result["total_reviews"]:
+                # visitor_review_count: GQL visitorReviews.total 항상 우선 (DOM/HTML 오래된 값 덮어쓰기)
+                _gql_visitor = gql_extras.get("visitor_review_total", "")
+                if _gql_visitor:
+                    result["visitor_review_count"] = _gql_visitor
+                # total_reviews: body_text 파싱값 유지 (합산 안 함); 미추출 시 GQL visitor 폴백
+                if not result["total_reviews"]:
                     result["total_reviews"] = gql_extras.get("visitor_review_total", "")
                 result["good_point_votes"] = gql_extras.get("good_point_votes", "")
                 result["feature_themes"] = gql_extras.get("feature_themes", "")
