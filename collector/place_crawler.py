@@ -36,7 +36,6 @@ PLACE_FIELDS = [
     "description",
     "ai_summary",
     "directions",
-    "photo_count",
     "visitor_review_count",
     "blog_review_count",
     "naedon_blog_review_count",
@@ -1429,7 +1428,6 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
 
                 button_link_text = await _collect_button_link_text(entry_frame)
                 image_alt_text = await _collect_image_alts(entry_frame)
-                img_count = await entry_frame.locator("img").count()
                 combined_text = "\n".join([body_text, button_link_text, image_alt_text])
 
                 h1_text = ""
@@ -1470,7 +1468,6 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["naver_pay_active"] = "Y" if "페이" in _nf else ""
                 result["talktalk_active"] = "Y" if "톡톡" in _nf else ""
                 result["coupon_active"] = extract_yes_no_keyword(combined_text, "쿠폰")
-                result["photo_count"] = extract_photo_count(body_text, img_count)
                 result["directions"] = extract_directions(body_text)
                 result["total_reviews"] = _extract_total_review_from_body(body_text)
                 # 스마트콜: 전화번호가 0507- 로 시작하면 Y, 아니면 N
@@ -1518,15 +1515,6 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         _bc = _extract_blog_review_count_from_html(html_content)
                         if _bc:
                             result["blog_review_count"] = _bc
-
-                    if not result["photo_count"]:
-                        for _pp in [r'"photoCount"\s*:\s*(\d+)',
-                                    r'"totalPhotoCount"\s*:\s*(\d+)',
-                                    r'"photoCnt"\s*:\s*(\d+)']:
-                            _m = re.search(_pp, html_content)
-                            if _m and int(_m.group(1)) > 0:
-                                result["photo_count"] = _m.group(1)
-                                break
 
                     if not result["keywords"]:
                         result["keywords"] = _extract_keywords_from_html(html_content)
