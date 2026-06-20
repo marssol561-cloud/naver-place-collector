@@ -25,6 +25,9 @@ _ADDR_NUMBER_SUFFIX_RE = re.compile(r"\s+\d[\d\-]*\s*$")
 # Matches /entry/place/{id}, /place/{id}, /restaurant/{id} in the final page URL
 # when Naver redirects directly to a place detail page (no searchIframe available)
 _DIRECT_URL_RE = re.compile(r"/(?:entry/place|restaurant|place)/(\d{6,})")
+# search_place_info 전용: Apollo cache JSON에서 상호명·도로명주소 추출
+_NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
+_ROAD_ADDR_RE = re.compile(r'"roadAddress"\s*:\s*"([^"]+)"')
 
 
 async def search_place_id(store_name: str, address: str) -> str | None:
@@ -136,6 +139,128 @@ async def _wait_for_frame(page, frame_name: str, timeout: float):
             return frame
         await page.wait_for_timeout(200)
     return None
+
+
+async def search_place_info(store_name: str, address: str) -> dict | None:
+    """
+    점포명+주소로 네이버 플레이스 검색 → {place_id, name, address} 반환.
+    검색 실패 시 None. search_place_id 함수는 그대로 보존(호환성 유지).
+    """
+    address_clean = _ADDR_NUMBER_SUFFIX_RE.sub("", address).strip()
+    parts = address_clean.split()
+
+    queries = [f"{store_name} {address_clean}"]
+    if len(parts) > 1:
+        queries.append(f"{store_name} {parts[-1]}")
+
+    for query in queries:
+        print(f"[검색] 쿼리 시도(info): {query!r}")
+        result = await _search_single_query_info(query, store_name)
+        if result is not None:
+            return result
+
+    print(f"[검색 실패] 모든 쿼리 소진(info): {store_name!r}")
+    return None
+
+
+async def _search_single_query_info(query: str, store_name: str) -> dict | None:
+    """search_place_id 내부 로직 재사용, {place_id, name, address} 반환."""
+    encoded = urllib.parse.quote(query)
+    url = _SEARCH_URL.format(query=encoded)
+
+    launch_options: dict = {
+        "headless": True,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    if PROXY_URL:
+        launch_options["proxy"] = {"server": PROXY_URL}
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(**launch_options)
+            try:
+                ctx = await browser.new_context(
+                    user_agent=_UA,
+                    viewport={"width": 1280, "height": 720},
+                )
+                page = await ctx.new_page()
+
+                try:
+                    await page.goto(url, timeout=15_000)
+                except PlaywrightTimeoutError:
+                    print(f"[오류] 페이지 로드 타임아웃(info): {store_name!r}")
+                    return None
+
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except PlaywrightTimeoutError:
+                    pass
+
+                m_direct = _DIRECT_URL_RE.search(page.url)
+                if m_direct and _NUMERIC_RE.match(m_direct.group(1)):
+                    pid = m_direct.group(1)
+                    print(f"[검색] direct-entry 리디렉트(info) place_id={pid}: {store_name!r}")
+                    try:
+                        page_html = await page.content()
+                        m_name = _NAME_RE.search(page_html)
+                        naver_name = m_name.group(1) if m_name else None
+                        m_addr = _ROAD_ADDR_RE.search(page_html)
+                        naver_addr = m_addr.group(1) if m_addr else None
+                    except Exception:
+                        naver_name = None
+                        naver_addr = None
+                    print(f"[검색(info)] direct 결과 name={naver_name!r} addr={naver_addr!r}")
+                    return {"place_id": pid, "name": naver_name, "address": naver_addr}
+
+                try:
+                    await page.wait_for_selector("iframe#searchIframe", timeout=12_000)
+                except PlaywrightTimeoutError:
+                    print(f"[오류] searchIframe 타임아웃(info): {store_name!r}")
+                    return None
+
+                search_frame = await _wait_for_frame(page, "searchIframe", timeout=8.0)
+                if search_frame is None:
+                    print(f"[오류] searchIframe 없음(info): {store_name!r}")
+                    return None
+
+                try:
+                    await search_frame.wait_for_selector("li", state="attached", timeout=15_000)
+                except PlaywrightTimeoutError:
+                    print(f"[검색 실패] li 없음(info): {store_name!r}")
+                    return None
+
+                if await search_frame.locator("li").count() == 0:
+                    print(f"[검색 실패] 결과 0건(info): {store_name!r}")
+                    return None
+
+                await page.wait_for_timeout(800)
+
+                html = await search_frame.content()
+                m = _ITEMS_RE.search(html)
+                if not (m and _NUMERIC_RE.match(m.group(1))):
+                    print(f"[오류] place_id 추출 실패(info): {store_name!r}")
+                    return None
+
+                place_id = m.group(1)
+
+                m_name = _NAME_RE.search(html)
+                naver_name = m_name.group(1) if m_name else None
+                if naver_name is None:
+                    print(f"[검색(info)] name 필드 payload에 없음 place_id={place_id}: {store_name!r}")
+
+                m_addr = _ROAD_ADDR_RE.search(html)
+                naver_addr = m_addr.group(1) if m_addr else None
+                if naver_addr is None:
+                    print(f"[검색(info)] roadAddress 필드 payload에 없음 place_id={place_id}: {store_name!r}")
+
+                return {"place_id": place_id, "name": naver_name, "address": naver_addr}
+
+            finally:
+                await browser.close()
+
+    except Exception as exc:
+        print(f"[오류] 브라우저 실행 실패(info): {store_name!r}: {exc}")
+        return None
 
 
 if __name__ == "__main__":

@@ -270,6 +270,9 @@ def upsert_store(
             # failed-crawl null can never overwrite an existing good value via the merge trigger.
             _safe_cd = {k: v for k, v in crawl_data.items() if v is not None and v != ""}
             patch_body: dict = {"crawl_data": _safe_cd}
+            _naver_name = _safe_cd.get("name")
+            if _naver_name:
+                patch_body["store_name"] = _naver_name
             if region:
                 patch_body["region"] = region
             _raw_cat = _safe_cd.get("category")
@@ -308,11 +311,14 @@ def upsert_store(
                 existing_id = null_rows[0]["store_id"]
                 # Secondary guard: exclude None/empty-string fields from PATCH (S2-FIX)
                 _safe_cd2 = {k: v for k, v in crawl_data.items() if v is not None and v != ""}
+                _naver_name2 = _safe_cd2.get("name")
                 upd: dict = {
                     "place_id": place_id,
                     "crawl_data": _safe_cd2,
                     "is_registered": True,
                 }
+                if _naver_name2:
+                    upd["store_name"] = _naver_name2
                 if region:
                     upd["region"] = region
                 _raw_cat = _safe_cd2.get("category")
@@ -332,9 +338,10 @@ def upsert_store(
                 return existing_id, False
 
             # 진짜 신규 → INSERT
+            _naver_name_ins = crawl_data.get("name")
             body: dict = {
                 "place_id": place_id,
-                "store_name": store_name,
+                "store_name": _naver_name_ins if _naver_name_ins else store_name,
                 "address": address,
                 "is_registered": True,
                 "crawl_data": crawl_data,

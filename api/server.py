@@ -91,6 +91,7 @@ class CollectRequest(BaseModel):
     address: Optional[str] = None
     place_id: Optional[str] = None
     force_refresh: bool = False
+    search_only: bool = False
 
 
 class CollectByStoreRequest(BaseModel):
@@ -227,6 +228,28 @@ async def get_visitor_reviews(store_id: str):
 @app.post("/api/v1/collect", dependencies=[Depends(verify_api_key)])
 async def collect(req: CollectRequest):
     start = time.monotonic()
+
+    # search_only 모드: 검색만 수행, 수집·저장 없음
+    if req.search_only:
+        if not req.store_name or not req.address:
+            return _error_resp("INVALID_REQUEST", "search_only 모드: store_name + address 필수", start, http_status=400)
+        try:
+            info = await searcher.search_place_info(req.store_name, req.address)
+        except Exception as e:
+            return _error_resp("SEARCH_FAILED", f"검색 오류: {e}", start)
+        if not info:
+            return JSONResponse(content={
+                "status": "place_not_found",
+                "message": "네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하세요.",
+                "elapsed_seconds": _elapsed(start),
+            })
+        return JSONResponse(content={
+            "status": "found",
+            "place_id": info["place_id"],
+            "name": info.get("name"),
+            "address": info.get("address"),
+            "elapsed_seconds": _elapsed(start),
+        })
 
     # 입력 검증
     if not req.place_id and (not req.store_name or not req.address):
