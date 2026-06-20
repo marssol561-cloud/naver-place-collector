@@ -28,6 +28,8 @@ _DIRECT_URL_RE = re.compile(r"/(?:entry/place|restaurant|place)/(\d{6,})")
 # search_place_info 전용: Apollo cache JSON에서 상호명·도로명주소 추출
 _NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
 _ROAD_ADDR_RE = re.compile(r'"roadAddress"\s*:\s*"([^"]+)"')
+# direct-entry 상세 페이지 <title> 태그에서 점포명 추출
+_TITLE_RE = re.compile(r'<title[^>]*>([^<]+)</title>')
 
 
 async def search_place_id(store_name: str, address: str) -> str | None:
@@ -202,9 +204,25 @@ async def _search_single_query_info(query: str, store_name: str) -> dict | None:
                     print(f"[검색] direct-entry 리디렉트(info) place_id={pid}: {store_name!r}")
                     try:
                         page_html = await page.content()
-                        m_name = _NAME_RE.search(page_html)
-                        naver_name = m_name.group(1) if m_name else None
-                        m_addr = _ROAD_ADDR_RE.search(page_html)
+                        # 1순위: <title> 태그에서 점포명 추출 (direct-entry 상세 페이지 최신 구조)
+                        # 예: "삼겹연구소 본오본점 - 네이버지도" → "삼겹연구소 본오본점"
+                        naver_name = None
+                        m_title = _TITLE_RE.search(page_html)
+                        if m_title:
+                            _title_raw = m_title.group(1).strip()
+                            _name_candidate = re.split(r'\s*[-:]\s*네이버', _title_raw)[0].strip()
+                            if _name_candidate:
+                                naver_name = _name_candidate
+                        # 2순위: Apollo cache PlaceListBusinessesItem 항목 정의에서 name 추출
+                        if naver_name is None:
+                            _item_pos = page_html.find(f'"PlaceListBusinessesItem:{pid}"')
+                            _snip = page_html[_item_pos:_item_pos + 1000] if _item_pos >= 0 else page_html
+                            m_name = _NAME_RE.search(_snip)
+                            naver_name = m_name.group(1) if m_name else None
+                        # address: Apollo cache roadAddress
+                        _item_pos2 = page_html.find(f'"PlaceListBusinessesItem:{pid}"')
+                        _snip2 = page_html[_item_pos2:_item_pos2 + 1000] if _item_pos2 >= 0 else page_html
+                        m_addr = _ROAD_ADDR_RE.search(_snip2)
                         naver_addr = m_addr.group(1) if m_addr else None
                     except Exception:
                         naver_name = None
@@ -243,12 +261,18 @@ async def _search_single_query_info(query: str, store_name: str) -> dict | None:
 
                 place_id = m.group(1)
 
-                m_name = _NAME_RE.search(html)
+                # place_id 특정 item 정의 위치에서 name/address 추출 (전체 html.search 보다 안정적)
+                _item_pos = html.find(f'"PlaceListBusinessesItem:{place_id}"')
+                if _item_pos >= 0:
+                    _snip = html[_item_pos:_item_pos + 1000]
+                else:
+                    _snip = html
+                m_name = _NAME_RE.search(_snip)
                 naver_name = m_name.group(1) if m_name else None
                 if naver_name is None:
                     print(f"[검색(info)] name 필드 payload에 없음 place_id={place_id}: {store_name!r}")
 
-                m_addr = _ROAD_ADDR_RE.search(html)
+                m_addr = _ROAD_ADDR_RE.search(_snip)
                 naver_addr = m_addr.group(1) if m_addr else None
                 if naver_addr is None:
                     print(f"[검색(info)] roadAddress 필드 payload에 없음 place_id={place_id}: {store_name!r}")
