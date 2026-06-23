@@ -190,7 +190,7 @@ def _extract_business_hours_from_expanded(expanded_text: str) -> str:
     idx_end = compact.find('접기', idx_h)
     section = compact[idx_h: idx_end] if idx_end != -1 else compact[idx_h: idx_h + 500]
     day_pat = re.compile(
-        r'(월|화|수|목|금|토|일)\s+(\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}|정기휴무(?:\s*\([^)]+\))?)'
+        r'(매일|월|화|수|목|금|토|일)\s+(\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}|정기휴무(?:\s*\([^)]+\))?)'
     )
     matches = day_pat.findall(section)
     if not matches:
