@@ -22,6 +22,15 @@ _ITEMS_RE = re.compile(
 )
 _NUMERIC_RE = re.compile(r"^\d+$")
 _ADDR_NUMBER_SUFFIX_RE = re.compile(r"\s+\d[\d\-]*\s*$")
+# Strips parenthetical dong annotation added by Naver road-address display: "(선부동)"
+_PAREN_RE = re.compile(r"\s*\([^)]*\)")
+# Strips floor/unit/commercial-block suffixes that poison the search query:
+#   층 variants: 1층, 2층, B1층, 지하1층
+#   호 variants: 101호, B07호, 가101호
+#   상가동 variants: 상가동, 상가A동 (commercial block name, NOT administrative dong)
+_DETAIL_SUFFIX_RE = re.compile(
+    r"\s+(?:[가-힣A-Za-z\d]+층|[가-힣A-Za-z]*\d+호|상가\S*동).*$"
+)
 # Matches /entry/place/{id}, /place/{id}, /restaurant/{id} in the final page URL
 # when Naver redirects directly to a place detail page (no searchIframe available)
 _DIRECT_URL_RE = re.compile(r"/(?:entry/place|restaurant|place)/(\d{6,})")
@@ -32,14 +41,22 @@ _ROAD_ADDR_RE = re.compile(r'"roadAddress"\s*:\s*"([^"]+)"')
 _TITLE_RE = re.compile(r'<title[^>]*>([^<]+)</title>')
 
 
+def _clean_address(address: str) -> str:
+    """주소에서 검색 노이즈 제거: 괄호 병기·층·호·상가동 등 상세 주소 suffix 삭제."""
+    addr = _PAREN_RE.sub("", address)        # "(선부동)" 제거
+    addr = _DETAIL_SUFFIX_RE.sub("", addr)  # "상가동 1층 102호", "1층" 등 제거
+    return addr.strip()
+
+
 async def search_place_id(store_name: str, address: str) -> str | None:
     """
     점포명+주소로 네이버 플레이스 place_id를 검색한다.
     검색 성공: place_id 문자열 반환
     검색 실패(플레이스 미등록 등): None 반환
     """
-    address_clean = _ADDR_NUMBER_SUFFIX_RE.sub("", address).strip()
-    parts = address_clean.split()
+    address_clean = _clean_address(address)
+    address_for_fallback = _ADDR_NUMBER_SUFFIX_RE.sub("", address_clean).strip()
+    parts = address_for_fallback.split()
 
     queries = [f"{store_name} {address_clean}"]
     if len(parts) > 1:
@@ -148,8 +165,9 @@ async def search_place_info(store_name: str, address: str) -> dict | None:
     점포명+주소로 네이버 플레이스 검색 → {place_id, name, address} 반환.
     검색 실패 시 None. search_place_id 함수는 그대로 보존(호환성 유지).
     """
-    address_clean = _ADDR_NUMBER_SUFFIX_RE.sub("", address).strip()
-    parts = address_clean.split()
+    address_clean = _clean_address(address)
+    address_for_fallback = _ADDR_NUMBER_SUFFIX_RE.sub("", address_clean).strip()
+    parts = address_for_fallback.split()
 
     queries = [f"{store_name} {address_clean}"]
     if len(parts) > 1:
