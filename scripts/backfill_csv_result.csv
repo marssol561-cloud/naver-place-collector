@@ -1,0 +1,21 @@
+batch_no,store_name,address,status,place_id,elapsed_s,note,industry,good_point_votes_ok,menu_mentions_ok,rating,total_reviews,verify_status
+1,834쭈꾸미 선부점,경기 안산시 단원구 달미로 64  (선부동) 상가동 1층 102호,collected,1971679966,56.4,,한식,Y,Y,NULL,861,PARTIAL(4/5)
+1,가르텐비어 인천청천점,인천 부평구 청천동 180-4,error,,41.9,불완전 렌더 — DB 기존 데이터 보존,N/A,N/A,N/A,N/A,N/A,no_place_id
+1,가족식당 장곡갈비,경기 시흥시 인선1길 8 2층,place_not_found,,43.8,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+1,감성쪽갈비 연수점,인천 연수구 연수동 606-11 1층,place_not_found,,43.8,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+1,갯바다해물샤브칼국수,인천 강화군 삼산면 매음리 639-54,place_not_found,,43.5,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+1,겹살이네,인천 서구 석남동 451-44,error,,33.9,불완전 렌더 — DB 기존 데이터 보존,N/A,N/A,N/A,N/A,N/A,no_place_id
+1,고기서고기,경기 광명시 광명동 56-3 1층,collected,1359873994,55.3,,돼지고기구이,Y,Y,NULL,2610,PARTIAL(4/5)
+1,광주원조불닭,경기 부천시 원미구 심곡동 162-9 1층,collected,1687128392,60.4,,닭발,Y,Y,NULL,101,PARTIAL(4/5)
+1,구주 부천역점,경기 부천시 원미구 심곡동 190-17 1층,collected,1405373886,56.5,,술집,Y,Y,NULL,1609,PARTIAL(4/5)
+1,국밥대장 검암1지구점,인천 서구 검암동 661-2,error,,39.9,불완전 렌더 — DB 기존 데이터 보존,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,그래요거 시흥거북섬점,경기 시흥시 정왕동 2709 보니타가 2동,place_not_found,,57.5,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,그리고카페,인천 옹진군 영흥면 내리 1622 1.2.4층,place_not_found,,56.1,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,깡통막창,경기 부천시 원미구 상동 532-3,place_not_found,,51.5,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,꼬꼬마래집,경기 부천시 원미구 도당동 180-6 1층,place_not_found,,52.1,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,꼬꼬마찬,경기 부천시 중동 595-9,place_not_found,,51.5,네이버 플레이스에서 점포를 찾지 못했습니다. 상호·주소를 확인하거나 place_id로 직접 입력하세요.,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,꼼숯,경기 부천시 원미구 중동 1125-1 1층,error,,90.9,timeout,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,냉삼회관 부천역점,경기 부천시 원미구 심곡동 399-2 1층,collected,1401357400,70.1,,돼지고기구이,Y,Y,NULL,1006,PARTIAL(4/5)
+2,다이닝야경 구월점,인천 남동구 구월동 1463-2,collected,1562156925,70.2,,술집,Y,Y,NULL,956,PARTIAL(4/5)
+2,닥터빈티지 본점,"경기 부천시 원미구 심곡동 386-4 1층,2층",error,,38.8,불완전 렌더 — DB 기존 데이터 보존,N/A,N/A,N/A,N/A,N/A,no_place_id
+2,단골,인천 부평구 부평동 159-17 1층,collected,2096969104,69.6,,술집,Y,Y,NULL,181,PARTIAL(4/5)

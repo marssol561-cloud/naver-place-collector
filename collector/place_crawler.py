@@ -66,8 +66,11 @@ ADDRESS_PREFIXES = (
 # ── Render-completeness guard (S2-FIX, 2026-06-06) ───────────────────────────
 # S2-VERIFY measured: incomplete body_text = 128 chars (2/3 runs),
 # complete body_text = 1,673+ chars (Phase-1 confirmed).
-# 500 is conservative: well above 128, well below 1,673.
-BODY_COMPLETENESS_THRESHOLD = 500
+# 2026-06-23 fix: 500→200. Compact stores (clothing/bar with few sections) render
+# valid content at 302-398 chars — well above the 128-char failure pattern but
+# below the original 500 threshold. 200 safely separates failures (≤128) from
+# valid compact pages (≥302). Gap: 128→302, threshold at 200 gives 72-char margin.
+BODY_COMPLETENESS_THRESHOLD = 200
 CRAWL_INCOMPLETE = "CRAWL_INCOMPLETE"
 
 
