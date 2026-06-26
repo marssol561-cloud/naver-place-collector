@@ -93,20 +93,43 @@ def find_store_by_place_id(place_id: str) -> dict | None:
 
 
 def find_store_by_name_address(store_name: str, address: str) -> dict | None:
-    """store_name+address로 stores 조회. 없으면 None."""
-    resp = requests.get(
-        f"{MASTER_DB_URL}/rest/v1/stores",
-        params={
-            "select": "store_id,place_id,store_name,address",
-            "store_name": f"eq.{store_name}",
-            "address": f"eq.{address}",
-        },
-        headers=_auth_headers(),
-        timeout=10,
-    )
-    resp.raise_for_status()
-    rows = resp.json()
-    return rows[0] if rows else None
+    """store_name+address로 stores 조회. 공백 정규화 매칭 포함. 없으면 None."""
+    norm_name = store_name.replace(" ", "")
+    norm_addr = address.replace(" ", "")
+
+    def _query_and_validate(qname: str, qaddr: str) -> dict | None:
+        resp = requests.get(
+            f"{MASTER_DB_URL}/rest/v1/stores",
+            params={
+                "select": "store_id,place_id,store_name,address",
+                "store_name": f"eq.{qname}",
+                "address": f"eq.{qaddr}",
+            },
+            headers=_auth_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            return None
+        row = rows[0]
+        # 공백 정규화 후 양쪽 모두 일치해야 반환 — 오매칭 방지
+        if (row["store_name"].replace(" ", "") == norm_name and
+                row["address"].replace(" ", "") == norm_addr):
+            return row
+        return None
+
+    for qname, qaddr in [
+        (store_name, address),   # Pass 1: exact (기존 동작 보존)
+        (norm_name, address),    # Pass 2: 이름 공백 제거
+        (store_name, norm_addr), # Pass 3: 주소 공백 제거
+        (norm_name, norm_addr),  # Pass 4: 양쪽 공백 제거
+    ]:
+        result = _query_and_validate(qname, qaddr)
+        if result:
+            return result
+
+    return None
 
 
 _STORE_ALLOWED_COLUMNS = frozenset({
