@@ -1,4 +1,5 @@
 import asyncio
+import html as _html
 import re
 import time
 import urllib.parse
@@ -177,6 +178,10 @@ async def search_place_info(store_name: str, address: str) -> dict | None:
         print(f"[검색] 쿼리 시도(info): {query!r}")
         result = await _search_single_query_info(query, store_name)
         if result is not None:
+            if result.get("name"):
+                result["name"] = _html.unescape(result["name"])
+            if result.get("address"):
+                result["address"] = _html.unescape(result["address"])
             return result
 
     print(f"[검색 실패] 모든 쿼리 소진(info): {store_name!r}")
