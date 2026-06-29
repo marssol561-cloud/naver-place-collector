@@ -296,6 +296,11 @@ def upsert_store(
             _naver_name = _safe_cd.get("name")
             if _naver_name:
                 patch_body["store_name"] = _naver_name
+            # Q1 FIX (2026-06-29): persist the user-typed 지번 into stores.address on re-collect,
+            # but ONLY when non-empty — an empty address must never overwrite an existing good value.
+            # server.py no longer backfills 도로명 into `address`, so this can only carry a real 지번.
+            if address:
+                patch_body["address"] = address
             if region:
                 patch_body["region"] = region
             _raw_cat = _safe_cd.get("category")

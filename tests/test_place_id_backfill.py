@@ -77,21 +77,28 @@ def _patch_crawl_chain(monkeypatch, mapped=None):
     return captured
 
 
-# ── T1: place_id-only (store_name='', address='') → backfill from crawl ────────
+# ── T1: place_id-only (store_name='', address='') ──────────────────────────────
+# Q1 FIX (2026-06-29): store_name still backfills from crawl, but address must NOT be
+# backfilled from lot_address(도로명). address stays "" so the 지번 column is never polluted.
+# region is still derived from the lot_address signal WITHOUT mutating address.
 
-def test_place_id_only_backfills_store_name_address(monkeypatch):
-    """place_id-only INSERT: upsert_store에 non-empty store_name/address/region 전달됨"""
+def test_place_id_only_backfills_store_name_not_address(monkeypatch):
+    """place_id-only INSERT: store_name/region 백필되지만 address는 도로명으로 오염되지 않음('')"""
     captured = _patch_crawl_chain(monkeypatch)
     asyncio.run(_do_crawl_and_save("", "", "99887766", time.monotonic()))
 
     assert captured["store_name"] == "테스트매장", (
         f"store_name 백필 실패: got {captured.get('store_name')!r}"
     )
-    assert captured["address"] == "서울시 강남구 테헤란로 1", (
-        f"address 백필 실패: got {captured.get('address')!r}"
+    assert captured["address"] == "", (
+        f"address가 도로명으로 오염됨 (빈 값이어야 함): got {captured.get('address')!r}"
     )
+    # region은 address가 비어도 lot_address 신호로 산출 (address 미오염)
     assert captured["region"] == "서울", (
-        f"region 재계산 실패: got {captured.get('region')!r}"
+        f"region 산출 실패: got {captured.get('region')!r}"
+    )
+    assert captured["region_input"] == "서울시 강남구 테헤란로 1", (
+        f"region은 lot_address 폴백에서 산출되어야 함: got {captured.get('region_input')!r}"
     )
 
 
@@ -108,10 +115,11 @@ def test_provided_name_address_not_overwritten(monkeypatch):
     assert captured["address"] == "인천시 남동구 구월동 1", "제공된 address가 보존되어야 함"
 
 
-# ── T3: lot_address 없고 lot_address_fallback만 있는 경우 ────────────────────────
+# ── T3: lot_address 없고 lot_address_fallback만 있어도 address 미오염 ──────────────
+# Q1 FIX (2026-06-29): address는 lot_address_fallback(도로명)으로도 백필되지 않는다.
 
-def test_lot_address_fallback_used_when_no_lot_address(monkeypatch):
-    """lot_address 없고 lot_address_fallback만 있으면 fallback으로 백필"""
+def test_address_not_backfilled_from_fallback(monkeypatch):
+    """lot_address_fallback만 있어도 address는 ''로 유지 (store_name/region만 산출)"""
     fallback_mapped = {
         "name": "폴백매장",
         "lot_address_fallback": "부산시 해운대구 해운대로 1",
@@ -121,4 +129,9 @@ def test_lot_address_fallback_used_when_no_lot_address(monkeypatch):
     asyncio.run(_do_crawl_and_save("", "", "11223344", time.monotonic()))
 
     assert captured["store_name"] == "폴백매장"
-    assert captured["address"] == "부산시 해운대구 해운대로 1"
+    assert captured["address"] == "", (
+        f"address가 도로명 폴백으로 오염됨: got {captured.get('address')!r}"
+    )
+    assert captured["region_input"] == "부산시 해운대구 해운대로 1", (
+        "region은 lot_address_fallback에서 산출되어야 함"
+    )

@@ -73,6 +73,11 @@ ADDRESS_PREFIXES = (
 BODY_COMPLETENESS_THRESHOLD = 200
 CRAWL_INCOMPLETE = "CRAWL_INCOMPLETE"
 
+# Q2 (2026-06-29): max business photo URLs persisted to store_business_images.image_urls.
+# business_photo_count keeps the true total; image_urls is capped here to bound row size.
+# When the real total exceeds this, truncation is logged (no silent cap).
+BUSINESS_IMAGE_URL_TARGET = 30
+
 
 def _is_render_complete(body_text: str) -> bool:
     """True if body_text length indicates a fully-rendered entryIframe."""
@@ -1212,12 +1217,16 @@ async def _fetch_business_photo_total(
     entry_frame,
     place_id: str,
     ptype: str = "restaurant",
-) -> int | None:
-    """Fetch actual business photo total via getPhotoViewerItems(filter='업체').
+) -> tuple[int | None, list]:
+    """Fetch actual business photo total + real photo URLs via getPhotoViewerItems(filter='업체').
 
     Navigates to /photo tab, clicks '업체' category, collects GQL responses,
     pages by scrolling until cursors[id='biz'].hasNext == False or hard cap reached.
-    Returns total count (int >= 1) or None on any error/block.
+    Returns (total_count, urls): total = int >= 1 photos counted; urls = de-duplicated
+    photos[].originalUrl in page order (field name confirmed live 2026-06-29 from
+    getPhotoViewerItems response — photos[].originalUrl = raw ldb-phinf/pstatic URL).
+    Returns (None, []) on any error/block. urls and total share the same responses, so
+    len(urls) == total (minus any photo lacking originalUrl).
     ISOLATION: never raises; all exceptions caught internally.
     Rate-limit safe: ≥3s between scroll pages; aborts on 429 (JSON parse fails → skipped).
     """
@@ -1245,7 +1254,7 @@ async def _fetch_business_photo_total(
             await entry_frame.goto(photo_url, wait_until="networkidle", timeout=20_000)
         except Exception as _ge:
             print(f"[업체사진] /photo 탭 이동 실패: {_ge}")
-            return None
+            return None, []
         await page.wait_for_timeout(3000)
 
         # Click "업체" category tab
@@ -1261,7 +1270,7 @@ async def _fetch_business_photo_total(
                 pass
         if not clicked:
             print(f"[업체사진] '업체' 탭 클릭 실패 place_id={place_id}")
-            return None
+            return None, []
 
         try:
             await page.wait_for_load_state("networkidle", timeout=8_000)
@@ -1271,10 +1280,12 @@ async def _fetch_business_photo_total(
 
         if not _collected:
             print(f"[업체사진] GQL 응답 없음 place_id={place_id}")
-            return None
+            return None, []
 
         def _parse_pv(resp):
-            """Returns (photos_count, has_next) from a getPhotoViewerItems response."""
+            """Returns (photos_count, has_next, urls) from a getPhotoViewerItems response.
+            urls = photos[].originalUrl (confirmed live field name) restricted to raw
+            ldb-phinf/pstatic image URLs."""
             items = resp if isinstance(resp, list) else [resp]
             for item in items:
                 if not isinstance(item, dict) or "data" not in item:
@@ -1283,15 +1294,32 @@ async def _fetch_business_photo_total(
                 photos = pv.get("photos") or []
                 cursors = pv.get("cursors") or []
                 biz = next((c for c in cursors if isinstance(c, dict) and c.get("id") == "biz"), {})
-                return len(photos), bool(biz.get("hasNext"))
-            return 0, False
+                _urls = []
+                for _p in photos:
+                    if not isinstance(_p, dict):
+                        continue
+                    _u = _p.get("originalUrl")
+                    if isinstance(_u, str) and ("ldb-phinf" in _u or "pstatic.net" in _u):
+                        _urls.append(_u)
+                return len(photos), bool(biz.get("hasNext")), _urls
+            return 0, False, []
 
         total = 0
         has_next = False
+        urls: list = []
+        _seen_urls: set = set()
+
+        def _add_urls(new_urls):
+            for _u in new_urls:
+                if _u not in _seen_urls:
+                    _seen_urls.add(_u)
+                    urls.append(_u)
+
         for _r in _collected:
-            _cnt, _hn = _parse_pv(_r)
+            _cnt, _hn, _us = _parse_pv(_r)
             total += _cnt
             has_next = _hn
+            _add_urls(_us)
 
         _HARD_CAP = 50
         _scroll_n = 0
@@ -1304,15 +1332,16 @@ async def _fetch_business_photo_total(
             if not _new:
                 break
             for _r in _new:
-                _cnt, _hn = _parse_pv(_r)
+                _cnt, _hn, _us = _parse_pv(_r)
                 total += _cnt
                 has_next = _hn
+                _add_urls(_us)
 
-        return total if total > 0 else None
+        return (total if total > 0 else None), urls
 
     except Exception as _e:
         print(f"[업체사진] 조회 오류 ({type(_e).__name__}): {str(_e)[:80]}")
-        return None
+        return None, []
     finally:
         page.remove_listener("response", _on_response)
 
@@ -1824,14 +1853,22 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["business_image_urls"] = _biz_urls
                 result["business_photo_count"] = _biz_count
 
-                # Fetch actual business photo total via getPhotoViewerItems(filter='업체').
-                # Overrides preview-based count when fetch succeeds; falls back on any error.
+                # Fetch actual business photo total + real URLs via getPhotoViewerItems(filter='업체').
+                # Overrides preview-based count AND the 5-URL home-preview list when fetch succeeds;
+                # falls back to the home-preview values on any error.
                 try:
-                    _real_biz_total = await _fetch_business_photo_total(
+                    _real_biz_total, _real_biz_urls = await _fetch_business_photo_total(
                         page, entry_frame, place_id, _ptype
                     )
                     if _real_biz_total is not None:
                         result["business_photo_count"] = _real_biz_total
+                    if _real_biz_urls:
+                        if len(_real_biz_urls) > BUSINESS_IMAGE_URL_TARGET:
+                            print(
+                                f"[업체사진] image_urls {len(_real_biz_urls)}개 → "
+                                f"{BUSINESS_IMAGE_URL_TARGET}개로 제한 저장 (count는 전체 유지)"
+                            )
+                        result["business_image_urls"] = _real_biz_urls[:BUSINESS_IMAGE_URL_TARGET]
                 except Exception as _bpte:
                     print(
                         f"[업체사진] total 조회 실패 (폴백 유지) "

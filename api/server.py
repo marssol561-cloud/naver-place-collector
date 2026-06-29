@@ -147,12 +147,17 @@ async def _do_crawl_and_save(
         mapped = master_db.sanitize_crawl_data(mapped)
         _biz_urls  = mapped.pop("business_image_urls", []) or []
         _biz_count = mapped.pop("business_photo_count", None)
-        # Backfill empty store_name/address from crawled data (place_id-only path)
+        # Backfill empty store_name from crawled data (place_id-only path).
         if not store_name:
             store_name = mapped.get("name") or ""
-        if not address:
-            address = (mapped.get("lot_address") or mapped.get("lot_address_fallback") or "")
-        region = master_db.extract_region(address)
+        # Q1 FIX (2026-06-29): NEVER backfill stores.address from lot_address — lot_address holds
+        # the 도로명(road name), and writing it into stores.address (the 지번 column) loses the
+        # user-typed 지번. address stays as supplied (may be "" on place_id-only path); the UPDATE
+        # path persists a real 지번 on re-collect. Consumers read 도로명 from crawl_data.lot_address.
+        # region is still derived from any available address signal WITHOUT mutating stores.address.
+        region = master_db.extract_region(
+            address or mapped.get("lot_address") or mapped.get("lot_address_fallback") or ""
+        )
         store_id, _ = master_db.upsert_store(place_id, store_name, address, mapped, region)
         if _biz_urls or _biz_count is not None:
             master_db.upsert_business_images(store_id, place_id, _biz_urls, _biz_count)
