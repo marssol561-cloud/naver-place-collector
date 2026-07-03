@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -266,6 +267,47 @@ def _log_unclassified(raw: str, store_id: str | None) -> None:
         log.warning("[industry_unclassified_log] INSERT failed: %s", exc)
 
 
+_ROAD_BUILDING_NUM_RE = re.compile(r"^\d+(-\d+)?$")
+
+
+def normalize_road_building_level(road_address: str | None) -> str | None:
+    """도로명 주소를 건물 레벨(도로명 + 건물 본번-부번)까지만 남기고 정규화.
+
+    괄호(법정동 등) 제거, 쉼표 제거, 공백 정규화 후 첫 번째 순수 숫자(-숫자) 토큰(본번-부번)
+    까지만 남기고 그 뒤(건물명·동·층·호 등)는 버린다.
+    예: "경인로644번길 13-5 플러스홈 101호" → "경인로644번길 13-5"
+    """
+    if not road_address:
+        return None
+    addr = re.sub(r"\([^)]*\)", " ", road_address)
+    addr = addr.replace(",", " ")
+    tokens = addr.split()
+    out = []
+    for tok in tokens:
+        out.append(tok)
+        if _ROAD_BUILDING_NUM_RE.match(tok):
+            break
+    result = " ".join(out).strip()
+    return result or None
+
+
+def _select_road_confirmed_candidate(candidates: list[dict], naver_lot_address: str | None) -> dict | None:
+    """place_id-NULL 동명 후보 중 건물레벨 도로명이 naver_lot_address와 일치하는 후보를 찾는다.
+
+    candidates: [{"store_id":..., "address":..., "road_address":...}, ...]
+    naver_lot_address: crawl_data.get("lot_address") — 네이버 크롤링 도로명.
+    일치하는 후보가 없거나 naver_lot_address 자체가 없으면 None (오버라이트 금지 → 호출부에서 INSERT로 폴백).
+    """
+    naver_road = normalize_road_building_level(naver_lot_address)
+    if not naver_road:
+        return None
+    for cand in candidates:
+        cand_road = normalize_road_building_level(cand.get("road_address") or cand.get("address"))
+        if cand_road and cand_road == naver_road:
+            return cand
+    return None
+
+
 def upsert_store(
     place_id: str | None,
     store_name: str,
@@ -323,10 +365,13 @@ def upsert_store(
             return store_id, False
         else:
             # place_id 미등록 레코드가 이미 존재하면 INSERT 대신 UPDATE (중복 방지)
+            # 동명이지만 다른 지역인 행을 잘못 채택하지 않도록, 건물레벨 도로명이
+            # 일치하는 후보만 채택한다(_select_road_confirmed_candidate). 불일치/후보없음 시
+            # 오버라이트하지 않고 아래 INSERT로 폴백한다.
             null_resp = requests.get(
                 base,
                 params={
-                    "select": "store_id",
+                    "select": "store_id,address,road_address",
                     "store_name": f"eq.{store_name}",
                     "place_id": "is.null",
                 },
@@ -335,8 +380,9 @@ def upsert_store(
             )
             null_resp.raise_for_status()
             null_rows = null_resp.json()
-            if null_rows:
-                existing_id = null_rows[0]["store_id"]
+            matched = _select_road_confirmed_candidate(null_rows, crawl_data.get("lot_address"))
+            if matched:
+                existing_id = matched["store_id"]
                 # Secondary guard: exclude None/empty-string fields from PATCH (S2-FIX)
                 _safe_cd2 = {k: v for k, v in crawl_data.items() if v is not None and v != ""}
                 _naver_name2 = _safe_cd2.get("name")
