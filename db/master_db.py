@@ -518,6 +518,71 @@ async def save_to_master_db(store_name: str, address: str) -> dict:
     return {"store_id": store_id, "place_id": place_id, "is_new": is_new}
 
 
+def search_stores_by_name(q: str, limit: int = 30) -> list[dict]:
+    """store_name ilike 부분일치 검색 (stores_store_name_trgm_idx 활용). 결과 없으면 빈 리스트."""
+    resp = requests.get(
+        f"{MASTER_DB_URL}/rest/v1/stores",
+        params={
+            "select": "store_id,place_id,store_name,address,region,rating,total_reviews",
+            "store_name": f"ilike.*{q}*",
+            "order": "total_reviews.desc.nullslast",
+            "limit": str(limit),
+        },
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def insert_ceo_note(
+    store_id: str,
+    place_id: str | None = None,
+    business_type: str | None = None,
+    taste_rating: str | None = None,
+    ceo_insight: str | None = None,
+    visited_on: str | None = None,
+) -> dict:
+    """store_ceo_notes INSERT. 공란이 아닌 필드만 전송. 삽입된 행 반환."""
+    body: dict = {"store_id": store_id}
+    if place_id:
+        body["place_id"] = place_id
+    if business_type:
+        body["business_type"] = business_type
+    if taste_rating:
+        body["taste_rating"] = taste_rating
+    if ceo_insight:
+        body["ceo_insight"] = ceo_insight
+    if visited_on:
+        body["visited_on"] = visited_on
+
+    resp = requests.post(
+        f"{MASTER_DB_URL}/rest/v1/store_ceo_notes",
+        json=body,
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows[0] if rows else body
+
+
+def get_ceo_notes(store_id: str) -> list[dict]:
+    """store_id로 store_ceo_notes 이력 조회 (visited_on desc, created_at desc). 없으면 빈 리스트."""
+    resp = requests.get(
+        f"{MASTER_DB_URL}/rest/v1/store_ceo_notes",
+        params={
+            "select": "note_id,store_id,place_id,business_type,taste_rating,ceo_insight,visited_on,created_at",
+            "store_id": f"eq.{store_id}",
+            "order": "visited_on.desc,created_at.desc",
+        },
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 if __name__ == "__main__":
     async def _main():
         headers = _auth_headers()

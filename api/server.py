@@ -100,6 +100,15 @@ class CollectByStoreRequest(BaseModel):
     mode: str = "incremental"
 
 
+class NoteCreateRequest(BaseModel):
+    store_id: Optional[str] = None
+    place_id: Optional[str] = None
+    business_type: Optional[str] = None
+    taste_rating: Optional[str] = None
+    ceo_insight: Optional[str] = None
+    visited_on: Optional[str] = None
+
+
 def _elapsed(start: float) -> float:
     return round(time.monotonic() - start, 1)
 
@@ -177,6 +186,66 @@ async def _do_crawl_and_save(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "naver-place-collector", "version": "1.4.1"}
+
+
+@app.get("/api/v1/stores/search", dependencies=[Depends(verify_api_key)])
+async def search_stores(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=30),
+):
+    try:
+        results = master_db.search_stores_by_name(q, limit)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error_code": "DB_ERROR", "message": f"검색 오류: {e}"},
+        )
+    return JSONResponse(content={"status": "ok", "results": results})
+
+
+@app.post("/api/v1/notes", dependencies=[Depends(verify_api_key)])
+async def create_note(req: NoteCreateRequest):
+    if not req.store_id:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error_code": "INVALID_REQUEST", "message": "store_id 필수"},
+        )
+    if not (req.business_type or req.taste_rating or req.ceo_insight):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": "business_type/taste_rating/ceo_insight 중 최소 1개 필요",
+            },
+        )
+    try:
+        note = master_db.insert_ceo_note(
+            store_id=req.store_id,
+            place_id=req.place_id,
+            business_type=req.business_type,
+            taste_rating=req.taste_rating,
+            ceo_insight=req.ceo_insight,
+            visited_on=req.visited_on,
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error_code": "DB_ERROR", "message": f"메모 저장 오류: {e}"},
+        )
+    return JSONResponse(content={"status": "ok", "note": note})
+
+
+@app.get("/api/v1/stores/{store_id}/notes", dependencies=[Depends(verify_api_key)])
+async def get_notes(store_id: str):
+    try:
+        notes = master_db.get_ceo_notes(store_id)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error_code": "DB_ERROR", "message": f"조회 오류: {e}"},
+        )
+    return JSONResponse(content={"status": "ok", "notes": notes})
 
 
 @app.get("/api/v1/stores/{store_id}", dependencies=[Depends(verify_api_key)])
