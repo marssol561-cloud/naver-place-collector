@@ -308,6 +308,20 @@ async def collect(req: CollectRequest):
         if not req.store_name or not req.address:
             return _error_resp("INVALID_REQUEST", "search_only 모드: store_name + address 필수", start, http_status=400)
         try:
+            row = master_db.find_store_by_name_address(req.store_name, req.address)
+            pid = row.get("place_id") if row else None
+            if pid:
+                print(f"[검색] 마스터DB 선조회 적중 place_id={pid}: {req.store_name!r}")
+                return JSONResponse(content={
+                    "status": "found",
+                    "place_id": row["place_id"],
+                    "name": row["store_name"],
+                    "address": row["address"],
+                    "elapsed_seconds": _elapsed(start),
+                })
+        except Exception as exc:
+            print(f"[검색] 마스터DB 선조회 실패, 네이버로 폴백: {exc}")
+        try:
             info = await searcher.search_place_info(req.store_name, req.address)
         except Exception as e:
             return _error_resp("SEARCH_FAILED", f"검색 오류: {e}", start)
