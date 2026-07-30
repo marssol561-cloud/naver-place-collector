@@ -190,6 +190,14 @@ async def search_place_info(store_name: str, address: str) -> dict | None:
 
 async def _search_single_query_info(query: str, store_name: str) -> dict | None:
     """search_place_id 내부 로직 재사용, {place_id, name, address} 반환."""
+
+    def is_unsafe_name(name: str | None) -> bool:
+        """확신할 수 없는 이름은 None으로 취급한다.
+        '장소'는 네이버 SPA가 실제 상호명으로 아직 갱신되지 않은 상태의 제네릭
+        플레이스홀더 타이틀이다 (실측: 2026-07-30, RESUME-4/STEP0 — t+1~2s
+        구간에서만 일시적으로 나타나고 t+4s 이내 항상 실제 이름으로 바뀜)."""
+        return not name or name.strip() == "장소"
+
     encoded = urllib.parse.quote(query)
     url = _SEARCH_URL.format(query=encoded)
 
@@ -219,8 +227,9 @@ async def _search_single_query_info(query: str, store_name: str) -> dict | None:
                 try:
                     await page.wait_for_load_state("networkidle", timeout=8_000)
                 except PlaywrightTimeoutError:
-                    pass
+                    print(f"[검색] networkidle 미달(info): {store_name!r}")
 
+                # Shape 1: 상단 URL이 /place/{id} 또는 /entry/place/{id}로 리디렉트되는 경우
                 m_direct = _DIRECT_URL_RE.search(page.url)
                 if m_direct and _NUMERIC_RE.match(m_direct.group(1)):
                     pid = m_direct.group(1)
@@ -250,13 +259,91 @@ async def _search_single_query_info(query: str, store_name: str) -> dict | None:
                     except Exception:
                         naver_name = None
                         naver_addr = None
+
+                    if is_unsafe_name(naver_name):
+                        # 제네릭 플레이스홀더('장소')로 의심 → 1회 한정 재확인(최대 3초 대기 후 title 재읽기)
+                        print(f"[검색] 이름 불확실 재확인(info) 1차값={naver_name!r}: {store_name!r}")
+                        await page.wait_for_timeout(3_000)
+                        try:
+                            page_html_retry = await page.content()
+                            m_title_retry = _TITLE_RE.search(page_html_retry)
+                            retry_name = None
+                            if m_title_retry:
+                                _retry_raw = re.split(r'\s*[-:]\s*네이버', m_title_retry.group(1).strip())[0].strip()
+                                if _retry_raw:
+                                    retry_name = _retry_raw
+                            naver_name = None if is_unsafe_name(retry_name) else retry_name
+                        except Exception:
+                            naver_name = None
+
                     print(f"[검색(info)] direct 결과 name={naver_name!r} addr={naver_addr!r}")
                     return {"place_id": pid, "name": naver_name, "address": naver_addr}
 
+                # Shape 2: 상단 URL은 검색 페이지 그대로이나, 네이버가 단일 강매치로 판단해
+                # iframe#entryIframe에 상세 페이지를 자동 임베드한 경우. 이 경우
+                # iframe#searchIframe은 생성되지 않는다 (실측: 2026-07-30, RESUME-4/STEP0).
+                try:
+                    entry_el = page.locator("iframe#entryIframe")
+                    await entry_el.wait_for(state="attached", timeout=3_000)
+                except PlaywrightTimeoutError:
+                    entry_el = None
+
+                if entry_el is not None:
+                    entry_src = await entry_el.get_attribute("src") or ""
+                    m_entry = _DIRECT_URL_RE.search(entry_src)
+                    if m_entry and _NUMERIC_RE.match(m_entry.group(1)):
+                        pid = m_entry.group(1)
+                        print(f"[검색] entryIframe 단일매치(info) place_id={pid}: {store_name!r}")
+
+                        entry_frame = None
+                        for _f in page.frames:
+                            if _f.name == "entryIframe":
+                                entry_frame = _f
+                                break
+
+                        naver_name = None
+                        naver_addr = None
+                        if entry_frame is not None:
+                            try:
+                                h1 = entry_frame.locator("h1").first
+                                if await h1.count():
+                                    _h1_text = (await h1.inner_text(timeout=3_000)).strip()
+                                    if not is_unsafe_name(_h1_text):
+                                        naver_name = _h1_text
+                                if naver_name is None:
+                                    # 1회 한정 재확인(최대 3초 대기 후 h1 재읽기)
+                                    await page.wait_for_timeout(3_000)
+                                    h1 = entry_frame.locator("h1").first
+                                    if await h1.count():
+                                        _h1_text = (await h1.inner_text(timeout=3_000)).strip()
+                                        if not is_unsafe_name(_h1_text):
+                                            naver_name = _h1_text
+
+                                frame_html = await entry_frame.content()
+                                m_addr = _ROAD_ADDR_RE.search(frame_html)
+                                naver_addr = m_addr.group(1) if m_addr else None
+                            except Exception:
+                                pass
+                        else:
+                            print(f"[검색(info)] entryIframe 프레임 접근 실패 place_id={pid}: {store_name!r}")
+
+                        print(f"[검색(info)] entryIframe 결과 name={naver_name!r} addr={naver_addr!r}")
+                        return {"place_id": pid, "name": naver_name, "address": naver_addr}
+
+                # Shape 3: 검색 결과 목록이 iframe#searchIframe 안에 표시되는 경우
                 try:
                     await page.wait_for_selector("iframe#searchIframe", timeout=12_000)
                 except PlaywrightTimeoutError:
-                    print(f"[오류] searchIframe 타임아웃(info): {store_name!r}")
+                    try:
+                        _iframe_ids = await page.eval_on_selector_all(
+                            "iframe", "els => els.map(e => e.id || e.name || '(no id)')"
+                        )
+                    except Exception:
+                        _iframe_ids = ["<조회 실패>"]
+                    print(
+                        f"[검색 실패] 페이지 형태 미인식(info) url={page.url} "
+                        f"iframes={_iframe_ids}: {store_name!r}"
+                    )
                     return None
 
                 search_frame = await _wait_for_frame(page, "searchIframe", timeout=8.0)
