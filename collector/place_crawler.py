@@ -143,6 +143,12 @@ def _context_after_marker(text: str, markers: list[str], limit: int) -> str:
     return ""
 
 
+# 실시간 상태 헤더 단어 — 확장(펼쳐보기) 실패 시 요약 텍스트에만 남는 오염원.
+# extract_business_hours/extract_last_order 가드와 _parse_expanded_hours_days 소비처가
+# 하나의 정의를 공유한다 (COMMIT 5, 2026-08-02).
+_REALTIME_STATUS_WORDS = ('영업 전', '영업 중', '영업 종료', '오늘 휴무', '곧 영업 시작')
+
+
 def extract_business_hours(text: str) -> str:
     context = _context_after_marker(
         text, ["영업시간", "영업 중", "영업 종료", "영업 전", "곧 영업 시작"], 300
@@ -153,7 +159,11 @@ def extract_business_hours(text: str) -> str:
     cut_points = [context.find(m) for m in stop_markers if context.find(m) > 0]
     if cut_points:
         context = context[: min(cut_points)].strip()
-    return context[:300]
+    context = context[:300]
+    if any(w in context for w in _REALTIME_STATUS_WORDS):
+        print(f"[영업시간 오염차단] realtime status detected, dropped: {context[:80]}")
+        return ""
+    return context
 
 
 def extract_last_order(text: str) -> str:
@@ -169,7 +179,15 @@ def extract_last_order(text: str) -> str:
         if compact.find(m, index + 1) != -1
     ]
     end = min(stop_candidates) if stop_candidates else index + 80
-    return compact[start:end].strip()[:120]
+    result = compact[start:end].strip()[:120]
+    if (
+        any(w in result for w in _REALTIME_STATUS_WORDS)
+        or len(result) > 40
+        or not re.search(_TIME_RE, result)
+    ):
+        print(f"[라스트오더 오염차단] implausible value, dropped: {result[:80]}")
+        return ""
+    return result
 
 
 def extract_break_time(text: str) -> str:
@@ -199,7 +217,6 @@ _LAST_ORDER_RE = re.compile(r'(' + _TIME_RE + r')\s*라스트오더')
 _BREAK_WORD_RE = re.compile(r'브레이크\s*타임')
 # 요일 토큰 뒤가 문자($/공백/'(')로 끝나야만 매치 — "화요일" 같은 일반 단어 오탐 방지
 _DAY_HEAD_RE = re.compile(r'^(매일|월|화|수|목|금|토|일)(?=$|\s|\()(\s*\([^)]*\))?\s*(.*)$')
-_REALTIME_STATUS_WORDS = ('영업 전', '영업 중', '영업 종료', '오늘 휴무', '곧 영업 시작')
 _DAYS_ORDER = ['월', '화', '수', '목', '금', '토', '일']
 
 
