@@ -1660,6 +1660,12 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
 
                     if not result["keywords"]:
                         result["keywords"] = _extract_keywords_from_html(html_content)
+                    # D6 계측 전용 (2026-08-02): keywords 간헐 결측 원인 미확정 — 워크어라운드 없이 진단 로그만 남김
+                    _kw_pattern_matched = bool(re.search(r'"keywordList"\s*:\s*\[', html_content)) if html_content else False
+                    print(
+                        f"[D6진단] keywords={result['keywords']!r} html_len={len(html_content)} "
+                        f"keywordList_pattern_matched={_kw_pattern_matched}"
+                    )
 
                     # parking: body_text에서 미추출 시 Apollo State parkingInfo 폴백
                     if not result["parking"]:
@@ -1683,17 +1689,21 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # 홈: visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
                 # 리뷰: visitorReviews.total → visitor_review_total (방문자 전용 카운트 폴백)
                 _ptype = "restaurant"  # default; overridden below from entry_frame URL
+                _stage = "init"  # 2026-08-02: 마지막으로 완료된 단계 — 광역 except 진단용 (COMMIT 1)
                 try:
+                    _stage = "goto:/home(1st)"
                     _m_pt = re.search(r"pcmap\.place\.naver\.com/([a-z]+)/", entry_frame.url)
                     _ptype = _m_pt.group(1) if _m_pt else "restaurant"
                     _gql_base = f"https://pcmap.place.naver.com/{_ptype}/{place_id}"
                     await entry_frame.goto(f"{_gql_base}/home", wait_until="networkidle", timeout=15_000)
                     await page.wait_for_timeout(1500)
+                    _stage = "expand:펼쳐보기"
                     # 홈 탭 '펼쳐보기' 클릭 → 요일별 영업시간/정기휴무 전체 노출
                     # 초기 body_text에는 상단 요약("영업 전 11:00에 영업 시작")만 표시됨
                     try:
                         _expand_btn = entry_frame.get_by_role("button", name="펼쳐보기")
-                        if await _expand_btn.count() > 0:
+                        _expand_count = await _expand_btn.count()
+                        if _expand_count > 0:
                             await _expand_btn.first.click(timeout=5000)
                             await page.wait_for_timeout(1000)
                             _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
@@ -1702,12 +1712,20 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                                 result["business_hours"] = _hours_structured
                             if not result["closed_days"]:
                                 result["closed_days"] = _extract_closed_days_from_expanded(_expanded_text)
-                    except Exception:
-                        pass
+                            print(
+                                f"[확장진단] 버튼count={_expand_count} "
+                                f"파싱결과={'있음' if _hours_structured else '빈값'}"
+                            )
+                        else:
+                            print("[확장진단] 버튼count=0 (펼쳐보기 버튼 미발견)")
+                    except Exception as _ee:
+                        print(f"[확장실패] stage=expand:펼쳐보기 {type(_ee).__name__}: {str(_ee)[:100]}")
+                    _stage = "goto:/review"
                     await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
                     await page.wait_for_timeout(3000)
                     # GQL 미수신 시 1회 재시도 (네트워크 지연 대응)
                     if not gql_responses:
+                        _stage = "gql:retry_home_review"
                         await entry_frame.goto(f"{_gql_base}/home", wait_until="networkidle", timeout=15_000)
                         await page.wait_for_timeout(1000)
                         await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
@@ -1729,6 +1747,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         if _vrs_found:
                             break
                     if not _vrs_found:
+                        _stage = "gql:vrs_retry"
                         print("[경고] visitorReviewStats GQL 미수신 - /home 재시도 (3초 대기)")
                         await entry_frame.goto(
                             f"{_gql_base}/home", wait_until="networkidle", timeout=15_000
@@ -1739,6 +1758,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     # description은 항상 "" 상태로 시작 → 조건 항상 True → /information 항상 탐색.
                     # goto /info → /home 리다이렉트(SPA 미지원). goto /information 은 정상 동작.
                     if not result["parking"] or not result["closed_days"] or not result["description"]:
+                        _stage = "goto:/information"
                         await entry_frame.goto(
                             f"{_gql_base}/information", wait_until="networkidle", timeout=15_000
                         )
@@ -1782,13 +1802,15 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                                 result["facilities"] = json.dumps(_merged, ensure_ascii=False)
 
                     # naedon blog fields — getFsasReviews buyWithMyMoneyType capture
+                    _stage = "naedon_blog_fields"
                     _naedon_count, _naedon_date = await _collect_naedon_blog_fields(
                         page, entry_frame, place_id, _ptype
                     )
                     result["naedon_blog_review_count"] = _naedon_count
                     result["naedon_blog_latest_date"] = _naedon_date
+                    _stage = "done"
                 except Exception as _e:
-                    print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
+                    print(f"[GQL 탭 이동 실패] stage={_stage} {type(_e).__name__}: {str(_e)[:100]}")
 
                 # phone_reservation_enabled: "예약" in facilities list.
                 # InformationFacilities id=1 ("예약") signals general reservation acceptance.
