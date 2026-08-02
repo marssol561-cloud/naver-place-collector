@@ -35,6 +35,7 @@ PLACE_FIELDS = [
     "keywords",
     "description",
     "ai_summary",
+    "ai_briefing",             # GQL aiBriefing.textSummaries[1:] (D8) — ai_summary(microReviews[0])와는 별개 필드
     "directions",
     "visitor_review_count",
     "blog_review_count",
@@ -1189,6 +1190,20 @@ def _extract_gql_item(data: dict, out: dict):
     if isinstance(cat, str) and cat.strip() and re.search(r'[가-힣]', cat):
         out.setdefault("category_gql", cat.strip()[:30])
 
+    # aiBriefing.textSummaries → ai_briefing (D8, 2026-08-02).
+    # textSummaries[0]은 "사용자 리뷰에 기반해 정리한 정보는 다음과 같습니다." 같은 안내 문구라 제외.
+    # hasAiBriefing:false인 매장은 aiBriefing 자체가 없음 — 빈 문자열이 정상(오류 아님).
+    briefing = _deep_find_gql(data, "aiBriefing")
+    if isinstance(briefing, dict):
+        summaries = briefing.get("textSummaries")
+        if isinstance(summaries, list) and len(summaries) > 1:
+            sentences = [
+                it["sentence"] for it in summaries[1:]
+                if isinstance(it, dict) and isinstance(it.get("sentence"), str) and it["sentence"].strip()
+            ]
+            if sentences:
+                out.setdefault("ai_briefing", " | ".join(sentences))
+
 
 def _parse_gql_extras(gql_responses: list) -> dict:
     """GraphQL 응답 목록 → 보강 필드 반환
@@ -1652,6 +1667,38 @@ async def _collect_naedon_blog_fields(
         page.remove_listener("response", _handler)
 
 
+# 게시물 날짜: "좋아요" 버튼 직후에만 등장 (D7, 2026-08-02).
+# "기간 2026.02.17." 같은 안내문 내 날짜는 휴무 시행일이지 게시일이 아니므로 절대 사용하지 않는다 —
+# RECON에서 확인된 함정: 최상단 게시물이 "기간" 문구를 포함할 때 그게 먼저 나온다.
+_NEWS_DATE_RE = re.compile(r'(\d{4})\.(\d{1,2})\.(\d{1,2})\.')
+
+
+def _extract_latest_news_date_from_feed(body_text: str) -> str:
+    """소식(feed) 탭 body_text에서 최신 게시물 발행일 추출. 'YYYY-MM-DD' 또는 실패 시 ''."""
+    idx = body_text.find('좋아요')
+    if idx == -1:
+        return ""
+    m = _NEWS_DATE_RE.search(body_text[idx: idx + 40])
+    if not m:
+        return ""
+    y, mo, d = m.groups()
+    return f"{y}-{int(mo):02d}-{int(d):02d}"
+
+
+async def _collect_latest_news_date(page, entry_frame, place_id: str, ptype: str = "restaurant") -> str:
+    """소식(feed) 탭 이동 후 최신 게시물 발행일 수집. 실패해도 다른 필드에 영향 주지 않도록
+    자체 try/except로 격리한다 — 이 함수 자체가 실패해도 호출부는 빈 문자열만 받는다."""
+    try:
+        feed_url = f"https://pcmap.place.naver.com/{ptype}/{place_id}/feed"
+        await entry_frame.goto(feed_url, wait_until="networkidle", timeout=15_000)
+        await page.wait_for_timeout(1500)
+        body_text = await entry_frame.locator("body").inner_text(timeout=8000)
+        return _extract_latest_news_date_from_feed(body_text)
+    except Exception as _e:
+        print(f"[소식탭] 수집 실패 stage=goto:/feed {type(_e).__name__}: {str(_e)[:80]}")
+        return ""
+
+
 # ── 메인 수집 함수 ────────────────────────────────────────────────────────────
 
 async def crawl_place_by_id(place_id: str) -> dict | None:
@@ -2059,6 +2106,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["feature_themes"] = gql_extras.get("feature_themes", "")
                 result["feature_mentions"] = gql_extras.get("feature_mentions", "")
                 result["menu_mentions"] = gql_extras.get("menu_mentions", "")
+                result["ai_briefing"] = gql_extras.get("ai_briefing", "")
                 # reply_rate: GQL 집계 결과 병합 (float 또는 None — 키 존재 여부로 판별)
                 if "reply_rate" in gql_extras:
                     result["reply_rate"] = gql_extras["reply_rate"]
@@ -2093,6 +2141,12 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 _menu_list, _menu_html = await _extract_menu_list_from_frame(page, entry_frame)
                 result["menu_list"] = _menu_list
                 result["menu_image_registered"] = _extract_menu_image_flag_from_html(_menu_html, place_id)
+
+                # 소식탭 최신 게시물 날짜 (D7, 2026-08-02) — 자체 try/except로 격리되어 있어
+                # 실패해도(피드 없음/타임아웃) 다른 필드에 영향 없음
+                result["latest_news_date"] = await _collect_latest_news_date(
+                    page, entry_frame, place_id, _ptype
+                )
 
                 _biz_urls, _biz_count = _extract_business_image_urls(html_content)
                 result["business_image_urls"] = _biz_urls
