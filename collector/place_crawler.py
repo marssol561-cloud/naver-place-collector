@@ -35,6 +35,7 @@ PLACE_FIELDS = [
     "keywords",
     "description",
     "ai_summary",
+    "ai_briefing",             # GQL aiBriefing.textSummaries[1:] (D8) — ai_summary(microReviews[0])와는 별개 필드
     "directions",
     "visitor_review_count",
     "blog_review_count",
@@ -142,6 +143,12 @@ def _context_after_marker(text: str, markers: list[str], limit: int) -> str:
     return ""
 
 
+# 실시간 상태 헤더 단어 — 확장(펼쳐보기) 실패 시 요약 텍스트에만 남는 오염원.
+# extract_business_hours/extract_last_order 가드와 _parse_expanded_hours_days 소비처가
+# 하나의 정의를 공유한다 (COMMIT 5, 2026-08-02).
+_REALTIME_STATUS_WORDS = ('영업 전', '영업 중', '영업 종료', '오늘 휴무', '곧 영업 시작')
+
+
 def extract_business_hours(text: str) -> str:
     context = _context_after_marker(
         text, ["영업시간", "영업 중", "영업 종료", "영업 전", "곧 영업 시작"], 300
@@ -152,7 +159,11 @@ def extract_business_hours(text: str) -> str:
     cut_points = [context.find(m) for m in stop_markers if context.find(m) > 0]
     if cut_points:
         context = context[: min(cut_points)].strip()
-    return context[:300]
+    context = context[:300]
+    if any(w in context for w in _REALTIME_STATUS_WORDS):
+        print(f"[영업시간 오염차단] realtime status detected, dropped: {context[:80]}")
+        return ""
+    return context
 
 
 def extract_last_order(text: str) -> str:
@@ -168,7 +179,15 @@ def extract_last_order(text: str) -> str:
         if compact.find(m, index + 1) != -1
     ]
     end = min(stop_candidates) if stop_candidates else index + 80
-    return compact[start:end].strip()[:120]
+    result = compact[start:end].strip()[:120]
+    if (
+        any(w in result for w in _REALTIME_STATUS_WORDS)
+        or len(result) > 40
+        or not re.search(_TIME_RE, result)
+    ):
+        print(f"[라스트오더 오염차단] implausible value, dropped: {result[:80]}")
+        return ""
+    return result
 
 
 def extract_break_time(text: str) -> str:
@@ -186,42 +205,205 @@ def extract_closed_days(text: str) -> str:
     return context[:120]
 
 
-def _extract_business_hours_from_expanded(expanded_text: str) -> str:
-    """펼쳐보기 클릭 후 요일별 영업시간 구조화 추출.
-    요일+시간 패턴을 '월 HH:MM-HH:MM | 화 ... | 일 정기휴무(매주 일요일)' 형태로 반환.
-    """
-    DAYS_ORDER = ['월', '화', '수', '목', '금', '토', '일']
-    compact = _compact_text(expanded_text)
-    idx_h = compact.find('영업시간')
+# ── 펼쳐보기 확장 패널 요일별 단일 패스 파서 (COMMIT 2, 2026-08-02) ──────────────
+# 이전에는 business_hours/closed_days를 각각 독립 정규식으로 스크래핑했음(D1/D4).
+# last_order/break_time은 확장 패널 재추출 자체가 없어 초기 요약 텍스트에 고정됐음(D2/D5).
+# 아래는 패널을 요일 단위로 한 번만 순회해 4개 필드를 함께 투영한다.
+_TIME_RE = r'\d{1,2}:\d{2}'
+_RANGE_RE = re.compile(
+    r'(' + _TIME_RE + r')\s*[-–~]\s*(다음\s*날\s*' + _TIME_RE + r'|' + _TIME_RE + r')'
+)
+_LAST_ORDER_RE = re.compile(r'(' + _TIME_RE + r')\s*라스트오더')
+_BREAK_WORD_RE = re.compile(r'브레이크\s*타임')
+# 요일 토큰 뒤가 문자($/공백/'(')로 끝나야만 매치 — "화요일" 같은 일반 단어 오탐 방지
+_DAY_HEAD_RE = re.compile(r'^(매일|월|화|수|목|금|토|일)(?=$|\s|\()(\s*\([^)]*\))?\s*(.*)$')
+_DAYS_ORDER = ['월', '화', '수', '목', '금', '토', '일']
+
+
+def _split_hours_section(expanded_text: str) -> str:
+    """'영업시간' 라벨부터 '접기' 직전까지, 줄바꿈을 보존한 원문 섹션만 추출."""
+    idx_h = expanded_text.find('영업시간')
     if idx_h == -1:
         return ""
-    idx_end = compact.find('접기', idx_h)
-    section = compact[idx_h: idx_end] if idx_end != -1 else compact[idx_h: idx_h + 500]
-    day_pat = re.compile(
-        r'(매일|월|화|수|목|금|토|일)\s+(\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}|정기휴무(?:\s*\([^)]+\))?)'
-    )
-    matches = day_pat.findall(section)
-    if not matches:
+    idx_end = expanded_text.find('접기', idx_h)
+    return expanded_text[idx_h: idx_end] if idx_end != -1 else expanded_text[idx_h: idx_h + 1000]
+
+
+def _normalize_range(raw_line: str) -> str:
+    """'11:00 - 22:00' -> '11:00-22:00'. '다음 날 02:00'은 원문 그대로 보존(26:00 변환 금지)."""
+    m = _RANGE_RE.search(raw_line)
+    if not m:
+        return raw_line.strip()
+    end = re.sub(r'\s+', ' ', m.group(2).strip())
+    return f"{m.group(1)}-{end}"
+
+
+def _consume_line_content(entry: dict, ln: str) -> None:
+    """요일 스코프 안의 한 줄을 hours/break/last_order/closed 중 해당하는 항목에 기록."""
+    if not ln:
+        return
+    entry["raw"].append(ln)
+    if '연중무휴' in ln:
+        # 연중무휴 = 휴무 없음(정기휴무의 반대 의미) — closed 플래그를 세우면 안 됨
+        entry["year_round"] = True
+        return
+    if '정기휴무' in ln:
+        entry["closed"] = True
+        paren = re.search(r'\(([^)]+)\)', ln)
+        entry["closed_detail"] = paren.group(1).strip() if paren else ""
+        return
+    if _BREAK_WORD_RE.search(ln) and _RANGE_RE.search(ln):
+        entry["break"].append(ln)
+        return
+    lo = _LAST_ORDER_RE.search(ln)
+    if lo:
+        entry["last_order"].append(lo.group(1))
+    if _RANGE_RE.search(ln) and '브레이크' not in ln:
+        entry["hours"].append(ln)
+
+
+def _parse_expanded_hours_days(expanded_text: str) -> dict:
+    """펼쳐보기 확장 패널을 요일 단위로 한 번만 순회해 구조화한다 (D1/D2/D4/D5 공통 소스).
+
+    realtime 상태 헤더(영업 전/영업 중/영업 종료/오늘 휴무)는 요일 스코프 진입 전에 나오므로
+    current가 None인 동안은 애초에 저장되지 않고, 방어적으로 문자열 필터도 추가로 건다.
+    """
+    section = _split_hours_section(expanded_text)
+    days: dict = {}
+    order: list = []
+    current = None
+    unit = None
+    if not section:
+        return {"unit": unit, "days": days, "order": order, "section": section}
+    lines = [ln.strip() for ln in section.split('\n') if ln.strip()]
+    for ln in lines:
+        if ln == '영업시간':
+            continue
+        if any(w in ln for w in _REALTIME_STATUS_WORDS):
+            continue
+        m = _DAY_HEAD_RE.match(ln)
+        if m:
+            token = m.group(1)
+            if token not in days:
+                days[token] = {
+                    "hours": [], "break": [], "last_order": [],
+                    "closed": False, "closed_detail": "", "year_round": False, "raw": [],
+                }
+                order.append(token)
+            current = token
+            if token == '매일':
+                unit = 'unit'
+            elif unit is None:
+                unit = 'per_day'
+            remainder = (m.group(3) or '').strip()
+            if remainder:
+                _consume_line_content(days[current], remainder)
+            continue
+        if current is None:
+            continue
+        _consume_line_content(days[current], ln)
+    return {"unit": unit, "days": days, "order": order, "section": section}
+
+
+def _project_business_hours(parsed: dict) -> str:
+    days, order, unit = parsed["days"], parsed["order"], parsed["unit"]
+    if not order:
         return ""
-    day_order = {d: i for i, d in enumerate(DAYS_ORDER)}
-    matches.sort(key=lambda x: day_order.get(x[0], 99))
+
+    def _day_str(day: str) -> str:
+        d = days[day]
+        if d["closed"]:
+            return f"{day} 정기휴무"
+        if d["hours"]:
+            return f"{day} " + "/".join(_normalize_range(h) for h in d["hours"])
+        if d["raw"]:
+            print(f"[영업시간 미인식] {day}: {' '.join(d['raw'])!r}")
+            return f"{day} " + " ".join(d["raw"])
+        return ""
+
+    if unit == 'unit' and len(order) == 1 and order[0] == '매일':
+        return _day_str('매일')
+    parts = [_day_str(d) for d in sorted(order, key=lambda x: _DAYS_ORDER.index(x) if x in _DAYS_ORDER else 99)]
+    return " | ".join(p for p in parts if p)
+
+
+def _project_break_time(parsed: dict) -> str:
+    days, order, unit = parsed["days"], parsed["order"], parsed["unit"]
+    if not order or not any(days[d]["break"] for d in order):
+        return ""  # 매장에 브레이크타임 자체가 없는 진짜 결측 — "없음" 반복 금지
+    if unit == 'unit' and len(order) == 1 and order[0] == '매일':
+        return "/".join(_normalize_range(b) for b in days['매일']["break"])
     parts = []
-    for day, hours in matches:
-        normalized = re.sub(r'\s*[-–]\s*', '-', hours.strip())
-        normalized = re.sub(r'\s+\(', '(', normalized)
-        parts.append(f"{day} {normalized}")
+    for day in sorted(order, key=lambda x: _DAYS_ORDER.index(x) if x in _DAYS_ORDER else 99):
+        d = days[day]
+        if d["break"]:
+            parts.append(f"{day} " + "/".join(_normalize_range(b) for b in d["break"]))
+        else:
+            parts.append(f"{day} 없음")
     return " | ".join(parts)
 
 
-def _extract_closed_days_from_expanded(expanded_text: str) -> str:
-    """펼쳐보기 클릭 후 정기휴무 정보 추출 — 괄호 내 텍스트(매주 일요일)만 반환."""
-    compact = _compact_text(expanded_text)
+def _project_last_order(parsed: dict) -> str:
+    days, order = parsed["days"], parsed["order"]
+    if not order:
+        return ""
+    values = {d: (days[d]["last_order"][0] if days[d]["last_order"] else None) for d in order}
+    present_days = [d for d in order if values[d]]
+    if not present_days:
+        return ""
+    distinct = {values[d] for d in present_days}
+    if len(distinct) == 1 and len(present_days) == len(order):
+        return distinct.pop()
+    ordered_present = sorted(present_days, key=lambda x: _DAYS_ORDER.index(x) if x in _DAYS_ORDER else 99)
+    return " | ".join(f"{d} {values[d]}" for d in ordered_present)
+
+
+def _project_closed_days(parsed: dict) -> str:
+    days, order, unit = parsed["days"], parsed["order"], parsed["unit"]
+    if unit == 'unit' and len(order) == 1 and order[0] == '매일':
+        d = days['매일']
+        if d["closed"]:
+            return d["closed_detail"] or "정기휴무"
+        if d["year_round"]:
+            return "연중무휴"
+    closed_list = [d for d in order if days[d]["closed"]]
+    if len(closed_list) == 1:
+        d = closed_list[0]
+        detail = days[d]["closed_detail"]
+        return detail if detail else f"매주 {d}요일"
+    if len(closed_list) > 1:
+        return " | ".join(f"{d} 정기휴무" for d in closed_list)
+    if any(days[d]["year_round"] for d in order):
+        return "연중무휴"
+    # 요일 스코프에서 못 찾은 경우 — 기존(전역 텍스트 검색) 방식 그대로 폴백.
+    # _extract_closed_days_from_expanded의 기존 동작(괄호형·연중무휴)을 그대로 보존한다.
+    compact = _compact_text(parsed.get("section", ""))
     m = re.search(r'정기휴무\s*\(([^)]+)\)', compact)
     if m:
         return m.group(1).strip()
     if '연중무휴' in compact:
         return '연중무휴'
     return ""
+
+
+def _extract_business_hours_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 요일별 영업시간 구조화 추출 (단일 패스 파서의 투영)."""
+    return _project_business_hours(_parse_expanded_hours_days(expanded_text))
+
+
+def _extract_break_time_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 요일별 브레이크타임 추출. 매장에 없으면 빈 문자열(진짜 결측)."""
+    return _project_break_time(_parse_expanded_hours_days(expanded_text))
+
+
+def _extract_last_order_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 요일별 라스트오더 추출. 전 요일 동일하면 단일값으로 축약."""
+    return _project_last_order(_parse_expanded_hours_days(expanded_text))
+
+
+def _extract_closed_days_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 정기휴무 정보 추출 — 매주 X요일 / 매달 N번째 X요일 / 연중무휴."""
+    return _project_closed_days(_parse_expanded_hours_days(expanded_text))
 
 
 def _extract_description_from_info(info_text: str) -> str:
@@ -758,15 +940,62 @@ def _extract_keywords_from_html(html: str) -> str:
     return ""
 
 
+# ── 메뉴탭 nav 경계 탐지 (COMMIT 3, 2026-08-02) ──────────────────────────────
+# 이전에는 "홈 소식 메뉴 리뷰 사진 정보" 6개 고정 시퀀스를 정규식으로 매칭했으나,
+# 실제 탭바는 매장/시점에 따라 탭 개수·이름이 바뀐다(예: 예약 탭 삽입 → 7개).
+# 고정 탭 리스트 대신 홈→메뉴→정보 세 앵커가 "짧은 한글 토큰들 사이"에 순서대로
+# 나타나는 첫 구간을 찾는다 — 탭이 늘거나 줄어도 앵커 사이 토큰 개수만 늘거나 줄 뿐
+# 매치 자체는 깨지지 않는다. 본문 깊숙한 곳의 우연한 매치를 막기 위해 앵커 사이
+# 토큰 개수(_NAV_MAX_SPAN_WORDS)와 토큰 길이(_NAV_TOKEN_MAXLEN)를 제한해 구간을 좁힌다.
+_NAV_ANCHOR_START = "홈"
+_NAV_ANCHOR_MID = "메뉴"
+_NAV_ANCHOR_END = "정보"
+_NAV_MAX_SPAN_WORDS = 10
+_NAV_TOKEN_MAXLEN = 4
+
+
+def _find_menu_nav_boundary(compact: str) -> int:
+    """탭바 '홈 ... 메뉴 ... 정보' 경계의 끝 문자 인덱스를 반환. 못 찾으면 -1."""
+    words = compact.split(' ')
+    n = len(words)
+    for i, word in enumerate(words):
+        if word != _NAV_ANCHOR_START:
+            continue
+        mid_idx = None
+        for j in range(i + 1, min(i + 1 + _NAV_MAX_SPAN_WORDS, n)):
+            token = words[j]
+            if token == _NAV_ANCHOR_MID:
+                mid_idx = j
+                break
+            if len(token) > _NAV_TOKEN_MAXLEN:
+                break  # 탭바가 아닌 긴 문장으로 이탈 — 이 '홈' 후보는 폐기
+        if mid_idx is None:
+            continue
+        end_idx = None
+        for k in range(mid_idx + 1, min(mid_idx + 1 + _NAV_MAX_SPAN_WORDS, n)):
+            token = words[k]
+            if token == _NAV_ANCHOR_END:
+                end_idx = k
+                break
+            if len(token) > _NAV_TOKEN_MAXLEN:
+                break
+        if end_idx is None:
+            continue
+        return len(' '.join(words[:end_idx + 1]))
+    return -1
+
+
 def extract_menu_items(text: str) -> str:
     compact = _compact_text(text)
     if not compact or not PRICE_PATTERN.search(compact):
         return ""
     items = []
     previous_end = 0
-    _nav = list(re.finditer(r'홈\s*소식\s*메뉴\s*리뷰\s*사진\s*정보', compact))
-    if _nav:
-        previous_end = _nav[-1].end()
+    _nav_end = _find_menu_nav_boundary(compact)
+    if _nav_end > 0:
+        previous_end = _nav_end
+    else:
+        print("[메뉴nav미발견] 탭바 경계(홈...메뉴...정보) 미발견 - 첫 메뉴명이 페이지 헤더를 흡수할 위험")
     for match in PRICE_PATTERN.finditer(compact, previous_end):
         raw_name = compact[previous_end: match.start()].strip()
         if len(raw_name) > 120:
@@ -977,6 +1206,20 @@ def _extract_gql_item(data: dict, out: dict):
     cat = _deep_find_gql(data, "category")
     if isinstance(cat, str) and cat.strip() and re.search(r'[가-힣]', cat):
         out.setdefault("category_gql", cat.strip()[:30])
+
+    # aiBriefing.textSummaries → ai_briefing (D8, 2026-08-02).
+    # textSummaries[0]은 "사용자 리뷰에 기반해 정리한 정보는 다음과 같습니다." 같은 안내 문구라 제외.
+    # hasAiBriefing:false인 매장은 aiBriefing 자체가 없음 — 빈 문자열이 정상(오류 아님).
+    briefing = _deep_find_gql(data, "aiBriefing")
+    if isinstance(briefing, dict):
+        summaries = briefing.get("textSummaries")
+        if isinstance(summaries, list) and len(summaries) > 1:
+            sentences = [
+                it["sentence"] for it in summaries[1:]
+                if isinstance(it, dict) and isinstance(it.get("sentence"), str) and it["sentence"].strip()
+            ]
+            if sentences:
+                out.setdefault("ai_briefing", " | ".join(sentences))
 
 
 def _parse_gql_extras(gql_responses: list) -> dict:
@@ -1441,6 +1684,38 @@ async def _collect_naedon_blog_fields(
         page.remove_listener("response", _handler)
 
 
+# 게시물 날짜: "좋아요" 버튼 직후에만 등장 (D7, 2026-08-02).
+# "기간 2026.02.17." 같은 안내문 내 날짜는 휴무 시행일이지 게시일이 아니므로 절대 사용하지 않는다 —
+# RECON에서 확인된 함정: 최상단 게시물이 "기간" 문구를 포함할 때 그게 먼저 나온다.
+_NEWS_DATE_RE = re.compile(r'(\d{4})\.(\d{1,2})\.(\d{1,2})\.')
+
+
+def _extract_latest_news_date_from_feed(body_text: str) -> str:
+    """소식(feed) 탭 body_text에서 최신 게시물 발행일 추출. 'YYYY-MM-DD' 또는 실패 시 ''."""
+    idx = body_text.find('좋아요')
+    if idx == -1:
+        return ""
+    m = _NEWS_DATE_RE.search(body_text[idx: idx + 40])
+    if not m:
+        return ""
+    y, mo, d = m.groups()
+    return f"{y}-{int(mo):02d}-{int(d):02d}"
+
+
+async def _collect_latest_news_date(page, entry_frame, place_id: str, ptype: str = "restaurant") -> str:
+    """소식(feed) 탭 이동 후 최신 게시물 발행일 수집. 실패해도 다른 필드에 영향 주지 않도록
+    자체 try/except로 격리한다 — 이 함수 자체가 실패해도 호출부는 빈 문자열만 받는다."""
+    try:
+        feed_url = f"https://pcmap.place.naver.com/{ptype}/{place_id}/feed"
+        await entry_frame.goto(feed_url, wait_until="networkidle", timeout=15_000)
+        await page.wait_for_timeout(1500)
+        body_text = await entry_frame.locator("body").inner_text(timeout=8000)
+        return _extract_latest_news_date_from_feed(body_text)
+    except Exception as _e:
+        print(f"[소식탭] 수집 실패 stage=goto:/feed {type(_e).__name__}: {str(_e)[:80]}")
+        return ""
+
+
 # ── 메인 수집 함수 ────────────────────────────────────────────────────────────
 
 async def crawl_place_by_id(place_id: str) -> dict | None:
@@ -1660,6 +1935,12 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
 
                     if not result["keywords"]:
                         result["keywords"] = _extract_keywords_from_html(html_content)
+                    # D6 계측 전용 (2026-08-02): keywords 간헐 결측 원인 미확정 — 워크어라운드 없이 진단 로그만 남김
+                    _kw_pattern_matched = bool(re.search(r'"keywordList"\s*:\s*\[', html_content)) if html_content else False
+                    print(
+                        f"[D6진단] keywords={result['keywords']!r} html_len={len(html_content)} "
+                        f"keywordList_pattern_matched={_kw_pattern_matched}"
+                    )
 
                     # parking: body_text에서 미추출 시 Apollo State parkingInfo 폴백
                     if not result["parking"]:
@@ -1683,31 +1964,55 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 # 홈: visitorReviewStats → good_point_votes, feature_mentions, menu_mentions
                 # 리뷰: visitorReviews.total → visitor_review_total (방문자 전용 카운트 폴백)
                 _ptype = "restaurant"  # default; overridden below from entry_frame URL
+                _stage = "init"  # 2026-08-02: 마지막으로 완료된 단계 — 광역 except 진단용 (COMMIT 1)
                 try:
+                    _stage = "goto:/home(1st)"
                     _m_pt = re.search(r"pcmap\.place\.naver\.com/([a-z]+)/", entry_frame.url)
                     _ptype = _m_pt.group(1) if _m_pt else "restaurant"
                     _gql_base = f"https://pcmap.place.naver.com/{_ptype}/{place_id}"
                     await entry_frame.goto(f"{_gql_base}/home", wait_until="networkidle", timeout=15_000)
                     await page.wait_for_timeout(1500)
+                    _stage = "expand:펼쳐보기"
                     # 홈 탭 '펼쳐보기' 클릭 → 요일별 영업시간/정기휴무 전체 노출
                     # 초기 body_text에는 상단 요약("영업 전 11:00에 영업 시작")만 표시됨
                     try:
                         _expand_btn = entry_frame.get_by_role("button", name="펼쳐보기")
-                        if await _expand_btn.count() > 0:
+                        _expand_count = await _expand_btn.count()
+                        if _expand_count > 0:
                             await _expand_btn.first.click(timeout=5000)
                             await page.wait_for_timeout(1000)
                             _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
-                            _hours_structured = _extract_business_hours_from_expanded(_expanded_text)
+                            # 패널을 요일 단위로 한 번만 파싱해 4개 필드에 함께 투영 (COMMIT 2, D1/D2/D4/D5)
+                            _parsed_days = _parse_expanded_hours_days(_expanded_text)
+                            _hours_structured = _project_business_hours(_parsed_days)
                             if _hours_structured:
                                 result["business_hours"] = _hours_structured
-                            if not result["closed_days"]:
-                                result["closed_days"] = _extract_closed_days_from_expanded(_expanded_text)
-                    except Exception:
-                        pass
+                            _break_structured = _project_break_time(_parsed_days)
+                            if _break_structured:
+                                result["break_time"] = _break_structured
+                            _lastorder_structured = _project_last_order(_parsed_days)
+                            if _lastorder_structured:
+                                result["last_order"] = _lastorder_structured
+                            _closed_structured = _project_closed_days(_parsed_days)
+                            if _closed_structured:
+                                result["closed_days"] = _closed_structured
+                            print(
+                                f"[확장진단] 버튼count={_expand_count} "
+                                f"hours={'있음' if _hours_structured else '빈값'} "
+                                f"break={'있음' if _break_structured else '빈값'} "
+                                f"lastorder={'있음' if _lastorder_structured else '빈값'} "
+                                f"closed={'있음' if _closed_structured else '빈값'}"
+                            )
+                        else:
+                            print("[확장진단] 버튼count=0 (펼쳐보기 버튼 미발견)")
+                    except Exception as _ee:
+                        print(f"[확장실패] stage=expand:펼쳐보기 {type(_ee).__name__}: {str(_ee)[:100]}")
+                    _stage = "goto:/review"
                     await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
                     await page.wait_for_timeout(3000)
                     # GQL 미수신 시 1회 재시도 (네트워크 지연 대응)
                     if not gql_responses:
+                        _stage = "gql:retry_home_review"
                         await entry_frame.goto(f"{_gql_base}/home", wait_until="networkidle", timeout=15_000)
                         await page.wait_for_timeout(1000)
                         await entry_frame.goto(f"{_gql_base}/review", wait_until="networkidle", timeout=20_000)
@@ -1729,6 +2034,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                         if _vrs_found:
                             break
                     if not _vrs_found:
+                        _stage = "gql:vrs_retry"
                         print("[경고] visitorReviewStats GQL 미수신 - /home 재시도 (3초 대기)")
                         await entry_frame.goto(
                             f"{_gql_base}/home", wait_until="networkidle", timeout=15_000
@@ -1739,6 +2045,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     # description은 항상 "" 상태로 시작 → 조건 항상 True → /information 항상 탐색.
                     # goto /info → /home 리다이렉트(SPA 미지원). goto /information 은 정상 동작.
                     if not result["parking"] or not result["closed_days"] or not result["description"]:
+                        _stage = "goto:/information"
                         await entry_frame.goto(
                             f"{_gql_base}/information", wait_until="networkidle", timeout=15_000
                         )
@@ -1782,13 +2089,15 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                                 result["facilities"] = json.dumps(_merged, ensure_ascii=False)
 
                     # naedon blog fields — getFsasReviews buyWithMyMoneyType capture
+                    _stage = "naedon_blog_fields"
                     _naedon_count, _naedon_date = await _collect_naedon_blog_fields(
                         page, entry_frame, place_id, _ptype
                     )
                     result["naedon_blog_review_count"] = _naedon_count
                     result["naedon_blog_latest_date"] = _naedon_date
+                    _stage = "done"
                 except Exception as _e:
-                    print(f"[GQL 탭 이동 실패] {type(_e).__name__}: {str(_e)[:100]}")
+                    print(f"[GQL 탭 이동 실패] stage={_stage} {type(_e).__name__}: {str(_e)[:100]}")
 
                 # phone_reservation_enabled: "예약" in facilities list.
                 # InformationFacilities id=1 ("예약") signals general reservation acceptance.
@@ -1814,6 +2123,7 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 result["feature_themes"] = gql_extras.get("feature_themes", "")
                 result["feature_mentions"] = gql_extras.get("feature_mentions", "")
                 result["menu_mentions"] = gql_extras.get("menu_mentions", "")
+                result["ai_briefing"] = gql_extras.get("ai_briefing", "")
                 # reply_rate: GQL 집계 결과 병합 (float 또는 None — 키 존재 여부로 판별)
                 if "reply_rate" in gql_extras:
                     result["reply_rate"] = gql_extras["reply_rate"]
@@ -1848,6 +2158,12 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                 _menu_list, _menu_html = await _extract_menu_list_from_frame(page, entry_frame)
                 result["menu_list"] = _menu_list
                 result["menu_image_registered"] = _extract_menu_image_flag_from_html(_menu_html, place_id)
+
+                # 소식탭 최신 게시물 날짜 (D7, 2026-08-02) — 자체 try/except로 격리되어 있어
+                # 실패해도(피드 없음/타임아웃) 다른 필드에 영향 없음
+                result["latest_news_date"] = await _collect_latest_news_date(
+                    page, entry_frame, place_id, _ptype
+                )
 
                 _biz_urls, _biz_count = _extract_business_image_urls(html_content)
                 result["business_image_urls"] = _biz_urls
