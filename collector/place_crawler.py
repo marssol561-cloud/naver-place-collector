@@ -922,15 +922,62 @@ def _extract_keywords_from_html(html: str) -> str:
     return ""
 
 
+# ── 메뉴탭 nav 경계 탐지 (COMMIT 3, 2026-08-02) ──────────────────────────────
+# 이전에는 "홈 소식 메뉴 리뷰 사진 정보" 6개 고정 시퀀스를 정규식으로 매칭했으나,
+# 실제 탭바는 매장/시점에 따라 탭 개수·이름이 바뀐다(예: 예약 탭 삽입 → 7개).
+# 고정 탭 리스트 대신 홈→메뉴→정보 세 앵커가 "짧은 한글 토큰들 사이"에 순서대로
+# 나타나는 첫 구간을 찾는다 — 탭이 늘거나 줄어도 앵커 사이 토큰 개수만 늘거나 줄 뿐
+# 매치 자체는 깨지지 않는다. 본문 깊숙한 곳의 우연한 매치를 막기 위해 앵커 사이
+# 토큰 개수(_NAV_MAX_SPAN_WORDS)와 토큰 길이(_NAV_TOKEN_MAXLEN)를 제한해 구간을 좁힌다.
+_NAV_ANCHOR_START = "홈"
+_NAV_ANCHOR_MID = "메뉴"
+_NAV_ANCHOR_END = "정보"
+_NAV_MAX_SPAN_WORDS = 10
+_NAV_TOKEN_MAXLEN = 4
+
+
+def _find_menu_nav_boundary(compact: str) -> int:
+    """탭바 '홈 ... 메뉴 ... 정보' 경계의 끝 문자 인덱스를 반환. 못 찾으면 -1."""
+    words = compact.split(' ')
+    n = len(words)
+    for i, word in enumerate(words):
+        if word != _NAV_ANCHOR_START:
+            continue
+        mid_idx = None
+        for j in range(i + 1, min(i + 1 + _NAV_MAX_SPAN_WORDS, n)):
+            token = words[j]
+            if token == _NAV_ANCHOR_MID:
+                mid_idx = j
+                break
+            if len(token) > _NAV_TOKEN_MAXLEN:
+                break  # 탭바가 아닌 긴 문장으로 이탈 — 이 '홈' 후보는 폐기
+        if mid_idx is None:
+            continue
+        end_idx = None
+        for k in range(mid_idx + 1, min(mid_idx + 1 + _NAV_MAX_SPAN_WORDS, n)):
+            token = words[k]
+            if token == _NAV_ANCHOR_END:
+                end_idx = k
+                break
+            if len(token) > _NAV_TOKEN_MAXLEN:
+                break
+        if end_idx is None:
+            continue
+        return len(' '.join(words[:end_idx + 1]))
+    return -1
+
+
 def extract_menu_items(text: str) -> str:
     compact = _compact_text(text)
     if not compact or not PRICE_PATTERN.search(compact):
         return ""
     items = []
     previous_end = 0
-    _nav = list(re.finditer(r'홈\s*소식\s*메뉴\s*리뷰\s*사진\s*정보', compact))
-    if _nav:
-        previous_end = _nav[-1].end()
+    _nav_end = _find_menu_nav_boundary(compact)
+    if _nav_end > 0:
+        previous_end = _nav_end
+    else:
+        print("[메뉴nav미발견] 탭바 경계(홈...메뉴...정보) 미발견 - 첫 메뉴명이 페이지 헤더를 흡수할 위험")
     for match in PRICE_PATTERN.finditer(compact, previous_end):
         raw_name = compact[previous_end: match.start()].strip()
         if len(raw_name) > 120:
