@@ -190,19 +190,52 @@ def extract_last_order(text: str) -> str:
     return result
 
 
+# 폴백 추출기(브레이크타임/휴무일) 전용 정지마커 — 확장 실패 시 요약 텍스트에 섞여드는
+# UI chrome/리뷰 조각을 컷한다 (COMMIT 6, 2026-08-02, closed_days/break_time 오염차단).
+_FALLBACK_STOP_MARKERS = (
+    "접기", "메뉴", "전화번호", "홈페이지",
+    "펼쳐보기", "AI 요약", "AI 브리핑", "더보기", "거리뷰", "알림받기", "공유",
+    "출발", "도착", "길찾기", "저장", "인스타그램", "편의", "안내", "복사",
+)
+_CLOSED_DAYS_MARKERS = ("정기휴무", "연중무휴", "휴무", "매주")
+
+
 def extract_break_time(text: str) -> str:
-    return _context_after_marker(text, ["브레이크타임", "브레이크 타임"], 120)
+    context = _context_after_marker(text, ["브레이크타임", "브레이크 타임"], 120)
+    if not context:
+        return ""
+    cut_points = [context.find(m) for m in _FALLBACK_STOP_MARKERS if context.find(m) > 0]
+    if cut_points:
+        context = context[: min(cut_points)].strip()
+    context = context[:120]
+    if (
+        any(m in context for m in _FALLBACK_STOP_MARKERS)
+        or any(w in context for w in _REALTIME_STATUS_WORDS)
+        or len(context) > 40
+        or not _RANGE_RE.search(context)
+    ):
+        print(f"[브레이크타임 오염차단] implausible value, dropped: {context[:80]}")
+        return ""
+    return context
 
 
 def extract_closed_days(text: str) -> str:
-    context = _context_after_marker(text, ["정기휴무", "연중무휴", "휴무", "매주"], 120)
+    context = _context_after_marker(text, list(_CLOSED_DAYS_MARKERS), 120)
     if not context:
         return ""
-    stop_markers = ["접기", "메뉴", "전화번호", "홈페이지"]
-    cut_points = [context.find(m) for m in stop_markers if context.find(m) > 0]
+    cut_points = [context.find(m) for m in _FALLBACK_STOP_MARKERS if context.find(m) > 0]
     if cut_points:
         context = context[: min(cut_points)].strip()
-    return context[:120]
+    context = context[:120]
+    if (
+        any(m in context for m in _FALLBACK_STOP_MARKERS)
+        or any(w in context for w in _REALTIME_STATUS_WORDS)
+        or len(context) > 40
+        or any(context.count(m) >= 2 for m in _CLOSED_DAYS_MARKERS)
+    ):
+        print(f"[휴무일 오염차단] implausible value, dropped: {context[:80]}")
+        return ""
+    return context
 
 
 # ── 펼쳐보기 확장 패널 요일별 단일 패스 파서 (COMMIT 2, 2026-08-02) ──────────────
