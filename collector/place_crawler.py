@@ -186,42 +186,206 @@ def extract_closed_days(text: str) -> str:
     return context[:120]
 
 
-def _extract_business_hours_from_expanded(expanded_text: str) -> str:
-    """펼쳐보기 클릭 후 요일별 영업시간 구조화 추출.
-    요일+시간 패턴을 '월 HH:MM-HH:MM | 화 ... | 일 정기휴무(매주 일요일)' 형태로 반환.
-    """
-    DAYS_ORDER = ['월', '화', '수', '목', '금', '토', '일']
-    compact = _compact_text(expanded_text)
-    idx_h = compact.find('영업시간')
+# ── 펼쳐보기 확장 패널 요일별 단일 패스 파서 (COMMIT 2, 2026-08-02) ──────────────
+# 이전에는 business_hours/closed_days를 각각 독립 정규식으로 스크래핑했음(D1/D4).
+# last_order/break_time은 확장 패널 재추출 자체가 없어 초기 요약 텍스트에 고정됐음(D2/D5).
+# 아래는 패널을 요일 단위로 한 번만 순회해 4개 필드를 함께 투영한다.
+_TIME_RE = r'\d{1,2}:\d{2}'
+_RANGE_RE = re.compile(
+    r'(' + _TIME_RE + r')\s*[-–~]\s*(다음\s*날\s*' + _TIME_RE + r'|' + _TIME_RE + r')'
+)
+_LAST_ORDER_RE = re.compile(r'(' + _TIME_RE + r')\s*라스트오더')
+_BREAK_WORD_RE = re.compile(r'브레이크\s*타임')
+# 요일 토큰 뒤가 문자($/공백/'(')로 끝나야만 매치 — "화요일" 같은 일반 단어 오탐 방지
+_DAY_HEAD_RE = re.compile(r'^(매일|월|화|수|목|금|토|일)(?=$|\s|\()(\s*\([^)]*\))?\s*(.*)$')
+_REALTIME_STATUS_WORDS = ('영업 전', '영업 중', '영업 종료', '오늘 휴무', '곧 영업 시작')
+_DAYS_ORDER = ['월', '화', '수', '목', '금', '토', '일']
+
+
+def _split_hours_section(expanded_text: str) -> str:
+    """'영업시간' 라벨부터 '접기' 직전까지, 줄바꿈을 보존한 원문 섹션만 추출."""
+    idx_h = expanded_text.find('영업시간')
     if idx_h == -1:
         return ""
-    idx_end = compact.find('접기', idx_h)
-    section = compact[idx_h: idx_end] if idx_end != -1 else compact[idx_h: idx_h + 500]
-    day_pat = re.compile(
-        r'(매일|월|화|수|목|금|토|일)\s+(\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}|정기휴무(?:\s*\([^)]+\))?)'
-    )
-    matches = day_pat.findall(section)
-    if not matches:
+    idx_end = expanded_text.find('접기', idx_h)
+    return expanded_text[idx_h: idx_end] if idx_end != -1 else expanded_text[idx_h: idx_h + 1000]
+
+
+def _normalize_range(raw_line: str) -> str:
+    """'11:00 - 22:00' -> '11:00-22:00'. '다음 날 02:00'은 원문 그대로 보존(26:00 변환 금지)."""
+    m = _RANGE_RE.search(raw_line)
+    if not m:
+        return raw_line.strip()
+    end = re.sub(r'\s+', ' ', m.group(2).strip())
+    return f"{m.group(1)}-{end}"
+
+
+def _consume_line_content(entry: dict, ln: str) -> None:
+    """요일 스코프 안의 한 줄을 hours/break/last_order/closed 중 해당하는 항목에 기록."""
+    if not ln:
+        return
+    entry["raw"].append(ln)
+    if '연중무휴' in ln:
+        # 연중무휴 = 휴무 없음(정기휴무의 반대 의미) — closed 플래그를 세우면 안 됨
+        entry["year_round"] = True
+        return
+    if '정기휴무' in ln:
+        entry["closed"] = True
+        paren = re.search(r'\(([^)]+)\)', ln)
+        entry["closed_detail"] = paren.group(1).strip() if paren else ""
+        return
+    if _BREAK_WORD_RE.search(ln) and _RANGE_RE.search(ln):
+        entry["break"].append(ln)
+        return
+    lo = _LAST_ORDER_RE.search(ln)
+    if lo:
+        entry["last_order"].append(lo.group(1))
+    if _RANGE_RE.search(ln) and '브레이크' not in ln:
+        entry["hours"].append(ln)
+
+
+def _parse_expanded_hours_days(expanded_text: str) -> dict:
+    """펼쳐보기 확장 패널을 요일 단위로 한 번만 순회해 구조화한다 (D1/D2/D4/D5 공통 소스).
+
+    realtime 상태 헤더(영업 전/영업 중/영업 종료/오늘 휴무)는 요일 스코프 진입 전에 나오므로
+    current가 None인 동안은 애초에 저장되지 않고, 방어적으로 문자열 필터도 추가로 건다.
+    """
+    section = _split_hours_section(expanded_text)
+    days: dict = {}
+    order: list = []
+    current = None
+    unit = None
+    if not section:
+        return {"unit": unit, "days": days, "order": order, "section": section}
+    lines = [ln.strip() for ln in section.split('\n') if ln.strip()]
+    for ln in lines:
+        if ln == '영업시간':
+            continue
+        if any(w in ln for w in _REALTIME_STATUS_WORDS):
+            continue
+        m = _DAY_HEAD_RE.match(ln)
+        if m:
+            token = m.group(1)
+            if token not in days:
+                days[token] = {
+                    "hours": [], "break": [], "last_order": [],
+                    "closed": False, "closed_detail": "", "year_round": False, "raw": [],
+                }
+                order.append(token)
+            current = token
+            if token == '매일':
+                unit = 'unit'
+            elif unit is None:
+                unit = 'per_day'
+            remainder = (m.group(3) or '').strip()
+            if remainder:
+                _consume_line_content(days[current], remainder)
+            continue
+        if current is None:
+            continue
+        _consume_line_content(days[current], ln)
+    return {"unit": unit, "days": days, "order": order, "section": section}
+
+
+def _project_business_hours(parsed: dict) -> str:
+    days, order, unit = parsed["days"], parsed["order"], parsed["unit"]
+    if not order:
         return ""
-    day_order = {d: i for i, d in enumerate(DAYS_ORDER)}
-    matches.sort(key=lambda x: day_order.get(x[0], 99))
+
+    def _day_str(day: str) -> str:
+        d = days[day]
+        if d["closed"]:
+            return f"{day} 정기휴무"
+        if d["hours"]:
+            return f"{day} " + "/".join(_normalize_range(h) for h in d["hours"])
+        if d["raw"]:
+            print(f"[영업시간 미인식] {day}: {' '.join(d['raw'])!r}")
+            return f"{day} " + " ".join(d["raw"])
+        return ""
+
+    if unit == 'unit' and len(order) == 1 and order[0] == '매일':
+        return _day_str('매일')
+    parts = [_day_str(d) for d in sorted(order, key=lambda x: _DAYS_ORDER.index(x) if x in _DAYS_ORDER else 99)]
+    return " | ".join(p for p in parts if p)
+
+
+def _project_break_time(parsed: dict) -> str:
+    days, order, unit = parsed["days"], parsed["order"], parsed["unit"]
+    if not order or not any(days[d]["break"] for d in order):
+        return ""  # 매장에 브레이크타임 자체가 없는 진짜 결측 — "없음" 반복 금지
+    if unit == 'unit' and len(order) == 1 and order[0] == '매일':
+        return "/".join(_normalize_range(b) for b in days['매일']["break"])
     parts = []
-    for day, hours in matches:
-        normalized = re.sub(r'\s*[-–]\s*', '-', hours.strip())
-        normalized = re.sub(r'\s+\(', '(', normalized)
-        parts.append(f"{day} {normalized}")
+    for day in sorted(order, key=lambda x: _DAYS_ORDER.index(x) if x in _DAYS_ORDER else 99):
+        d = days[day]
+        if d["break"]:
+            parts.append(f"{day} " + "/".join(_normalize_range(b) for b in d["break"]))
+        else:
+            parts.append(f"{day} 없음")
     return " | ".join(parts)
 
 
-def _extract_closed_days_from_expanded(expanded_text: str) -> str:
-    """펼쳐보기 클릭 후 정기휴무 정보 추출 — 괄호 내 텍스트(매주 일요일)만 반환."""
-    compact = _compact_text(expanded_text)
+def _project_last_order(parsed: dict) -> str:
+    days, order = parsed["days"], parsed["order"]
+    if not order:
+        return ""
+    values = {d: (days[d]["last_order"][0] if days[d]["last_order"] else None) for d in order}
+    present_days = [d for d in order if values[d]]
+    if not present_days:
+        return ""
+    distinct = {values[d] for d in present_days}
+    if len(distinct) == 1 and len(present_days) == len(order):
+        return distinct.pop()
+    ordered_present = sorted(present_days, key=lambda x: _DAYS_ORDER.index(x) if x in _DAYS_ORDER else 99)
+    return " | ".join(f"{d} {values[d]}" for d in ordered_present)
+
+
+def _project_closed_days(parsed: dict) -> str:
+    days, order, unit = parsed["days"], parsed["order"], parsed["unit"]
+    if unit == 'unit' and len(order) == 1 and order[0] == '매일':
+        d = days['매일']
+        if d["closed"]:
+            return d["closed_detail"] or "정기휴무"
+        if d["year_round"]:
+            return "연중무휴"
+    closed_list = [d for d in order if days[d]["closed"]]
+    if len(closed_list) == 1:
+        d = closed_list[0]
+        detail = days[d]["closed_detail"]
+        return detail if detail else f"매주 {d}요일"
+    if len(closed_list) > 1:
+        return " | ".join(f"{d} 정기휴무" for d in closed_list)
+    if any(days[d]["year_round"] for d in order):
+        return "연중무휴"
+    # 요일 스코프에서 못 찾은 경우 — 기존(전역 텍스트 검색) 방식 그대로 폴백.
+    # _extract_closed_days_from_expanded의 기존 동작(괄호형·연중무휴)을 그대로 보존한다.
+    compact = _compact_text(parsed.get("section", ""))
     m = re.search(r'정기휴무\s*\(([^)]+)\)', compact)
     if m:
         return m.group(1).strip()
     if '연중무휴' in compact:
         return '연중무휴'
     return ""
+
+
+def _extract_business_hours_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 요일별 영업시간 구조화 추출 (단일 패스 파서의 투영)."""
+    return _project_business_hours(_parse_expanded_hours_days(expanded_text))
+
+
+def _extract_break_time_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 요일별 브레이크타임 추출. 매장에 없으면 빈 문자열(진짜 결측)."""
+    return _project_break_time(_parse_expanded_hours_days(expanded_text))
+
+
+def _extract_last_order_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 요일별 라스트오더 추출. 전 요일 동일하면 단일값으로 축약."""
+    return _project_last_order(_parse_expanded_hours_days(expanded_text))
+
+
+def _extract_closed_days_from_expanded(expanded_text: str) -> str:
+    """펼쳐보기 클릭 후 정기휴무 정보 추출 — 매주 X요일 / 매달 N번째 X요일 / 연중무휴."""
+    return _project_closed_days(_parse_expanded_hours_days(expanded_text))
 
 
 def _extract_description_from_info(info_text: str) -> str:
@@ -1707,14 +1871,26 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                             await _expand_btn.first.click(timeout=5000)
                             await page.wait_for_timeout(1000)
                             _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
-                            _hours_structured = _extract_business_hours_from_expanded(_expanded_text)
+                            # 패널을 요일 단위로 한 번만 파싱해 4개 필드에 함께 투영 (COMMIT 2, D1/D2/D4/D5)
+                            _parsed_days = _parse_expanded_hours_days(_expanded_text)
+                            _hours_structured = _project_business_hours(_parsed_days)
                             if _hours_structured:
                                 result["business_hours"] = _hours_structured
-                            if not result["closed_days"]:
-                                result["closed_days"] = _extract_closed_days_from_expanded(_expanded_text)
+                            _break_structured = _project_break_time(_parsed_days)
+                            if _break_structured:
+                                result["break_time"] = _break_structured
+                            _lastorder_structured = _project_last_order(_parsed_days)
+                            if _lastorder_structured:
+                                result["last_order"] = _lastorder_structured
+                            _closed_structured = _project_closed_days(_parsed_days)
+                            if _closed_structured:
+                                result["closed_days"] = _closed_structured
                             print(
                                 f"[확장진단] 버튼count={_expand_count} "
-                                f"파싱결과={'있음' if _hours_structured else '빈값'}"
+                                f"hours={'있음' if _hours_structured else '빈값'} "
+                                f"break={'있음' if _break_structured else '빈값'} "
+                                f"lastorder={'있음' if _lastorder_structured else '빈값'} "
+                                f"closed={'있음' if _closed_structured else '빈값'}"
                             )
                         else:
                             print("[확장진단] 버튼count=0 (펼쳐보기 버튼 미발견)")
