@@ -1749,6 +1749,45 @@ async def _collect_latest_news_date(page, entry_frame, place_id: str, ptype: str
         return ""
 
 
+async def _rank_hours_expand_candidates(entry_frame, max_wait_ms: int = 8000) -> list[int]:
+    """'펼쳐보기' 버튼(접근성 이름 공유, unfold2 i18n 키)이 페이지에 여러 개 있을 수 있어
+    (주소/길찾기/영업시간/편의시설 행 등) DOM 순서 인덱스 리스트를 반환하되, 조상 텍스트에
+    실시간 영업상태 문구(_REALTIME_STATUS_WORDS)를 담고 있는 인덱스를 앞으로 정렬한다.
+    최소 1개 매치가 나타날 때까지 최대 max_wait_ms 밀리초 대기한다."""
+    btn = entry_frame.get_by_role("button", name="펼쳐보기")
+    try:
+        await btn.first.wait_for(state="attached", timeout=max_wait_ms)
+    except PlaywrightTimeoutError:
+        return []
+    count = await btn.count()
+    if count == 0:
+        return []
+    anchored: list[int] = []
+    rest: list[int] = []
+    _status_words = list(_REALTIME_STATUS_WORDS)
+    for i in range(count):
+        is_hours = False
+        try:
+            is_hours = await btn.nth(i).evaluate(
+                """(el, words) => {
+                    let node = el.parentElement;
+                    let hops = 0;
+                    while (node && hops < 15) {
+                        const t = node.innerText || '';
+                        if (words.some(w => t.includes(w))) return true;
+                        node = node.parentElement;
+                        hops++;
+                    }
+                    return false;
+                }""",
+                _status_words,
+            )
+        except Exception:
+            is_hours = False
+        (anchored if is_hours else rest).append(i)
+    return anchored + rest
+
+
 # ── 메인 수집 함수 ────────────────────────────────────────────────────────────
 
 async def crawl_place_by_id(place_id: str) -> dict | None:
@@ -2008,15 +2047,45 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                     _stage = "expand:펼쳐보기"
                     # 홈 탭 '펼쳐보기' 클릭 → 요일별 영업시간/정기휴무 전체 노출
                     # 초기 body_text에는 상단 요약("영업 전 11:00에 영업 시작")만 표시됨
+                    # 페이지에는 '펼쳐보기'라는 동일 접근성 이름을 가진 버튼이 여러 개(주소/길찾기/
+                    # 영업시간/편의시설 행 등) 있을 수 있어, 영업시간 행에 앵커링한 후보를 먼저 클릭하고
+                    # 요일 파싱 성공(order 비어있지 않음) 여부로 검증한 뒤 실패하면 나머지 후보를
+                    # DOM 순서대로 시도한다.
                     try:
+                        _candidate_order = await _rank_hours_expand_candidates(entry_frame)
+                        _expand_count = len(_candidate_order)
                         _expand_btn = entry_frame.get_by_role("button", name="펼쳐보기")
-                        _expand_count = await _expand_btn.count()
-                        if _expand_count > 0:
-                            await _expand_btn.first.click(timeout=5000)
-                            await page.wait_for_timeout(1000)
-                            _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
+                        _clicked_index = None
+                        _parsed_days = None
+                        for _cand_idx in _candidate_order[:6]:
+                            try:
+                                _cand_loc = _expand_btn.nth(_cand_idx)
+                                # 고정(sticky) 상단 헤더가 스크롤 위치에 따라 버튼을 가려
+                                # 포인터 이벤트를 가로채는 경우가 있음 (place_tab_shadow 등) —
+                                # 뷰포트 중앙으로 스크롤해 헤더와 겹치지 않게 한 뒤 force 클릭.
+                                try:
+                                    await _cand_loc.evaluate(
+                                        "el => el.scrollIntoView({block: 'center', inline: 'nearest'})"
+                                    )
+                                    await page.wait_for_timeout(200)
+                                except Exception:
+                                    pass
+                                await _cand_loc.click(timeout=5000, force=True)
+                                await page.wait_for_timeout(1000)
+                                _expanded_text = await entry_frame.locator("body").inner_text(timeout=5000)
+                                _try_parsed = _parse_expanded_hours_days(_expanded_text)
+                                if _try_parsed.get("order"):
+                                    _parsed_days = _try_parsed
+                                    _clicked_index = _cand_idx
+                                    break
+                            except Exception as _click_exc:
+                                print(
+                                    f"[확장실패] stage=expand:anchor candidate={_cand_idx} "
+                                    f"{type(_click_exc).__name__}: {str(_click_exc)[:100]}"
+                                )
+                                continue
+                        if _parsed_days is not None:
                             # 패널을 요일 단위로 한 번만 파싱해 4개 필드에 함께 투영 (COMMIT 2, D1/D2/D4/D5)
-                            _parsed_days = _parse_expanded_hours_days(_expanded_text)
                             _hours_structured = _project_business_hours(_parsed_days)
                             if _hours_structured:
                                 result["business_hours"] = _hours_structured
@@ -2030,14 +2099,17 @@ async def crawl_place_by_id(place_id: str) -> dict | None:
                             if _closed_structured:
                                 result["closed_days"] = _closed_structured
                             print(
-                                f"[확장진단] 버튼count={_expand_count} "
+                                f"[확장진단] 버튼count={_expand_count} clicked_index={_clicked_index} "
                                 f"hours={'있음' if _hours_structured else '빈값'} "
                                 f"break={'있음' if _break_structured else '빈값'} "
                                 f"lastorder={'있음' if _lastorder_structured else '빈값'} "
                                 f"closed={'있음' if _closed_structured else '빈값'}"
                             )
                         else:
-                            print("[확장진단] 버튼count=0 (펼쳐보기 버튼 미발견)")
+                            print(
+                                f"[확장실패] stage=expand:anchor candidates={_expand_count} "
+                                f"reason=no-candidate-opened-hours"
+                            )
                     except Exception as _ee:
                         print(f"[확장실패] stage=expand:펼쳐보기 {type(_ee).__name__}: {str(_ee)[:100]}")
                     _stage = "goto:/review"
