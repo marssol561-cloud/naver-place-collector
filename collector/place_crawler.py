@@ -751,6 +751,17 @@ def _extract_parking_info_from_html(html: str) -> dict:
     elif is_free is False:
         out["is_free"] = "N"
 
+    # PARKING-FEE-FALLBACK: owner left the free-text note empty but filled the fee
+    # table — build the description from the fee fields instead.
+    if not out.get("description") and isinstance(basic, dict):
+        _fees = []
+        for _k in ("normalFeeDescription", "extraFeeDescription"):
+            _v = basic.get(_k)
+            if isinstance(_v, str) and _v.strip():
+                _fees.append(_v.strip())
+        if _fees:
+            out["description"] = " / ".join(_fees)
+
     return out
 
 
