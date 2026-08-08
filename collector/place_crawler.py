@@ -128,7 +128,7 @@ def _extract_address(text: str) -> str:
     prefixes = "|".join(re.escape(p) for p in ADDRESS_PREFIXES)
     pattern = (
         rf"((?:{prefixes})\s+[가-힣A-Za-z0-9\s.\-]+?"
-        r"(?:로|길|대로|번길)\s*\d+(?:\s*\d*층?)?)"
+        r"(?:로|길|대로|번길)\s*\d+(?:-\d+)?)(?![\d])(?!\s*번?안?길)"
     )
     match = re.search(pattern, compact)
     return match.group(1).strip() if match else ""
